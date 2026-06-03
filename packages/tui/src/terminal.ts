@@ -116,22 +116,19 @@ function isWindowsSubsystemForLinux(): boolean {
 /**
  * Whether the native console viewport-position probe should be consulted.
  *
- * Returns `true` only on native Windows that is *not* fronted by Windows
- * Terminal. The kernel32 `GetConsoleScreenBufferInfo` API answers about the
- * ConPTY pseudo-console — which is always pinned to its tail — and not about
- * the user-visible scrollback in modern hosts. Treat any such host as
- * unreportable so the renderer falls back to the deferred-rebuild path.
- *
- * Pure helper for unit testing; the runtime call site reads `$env` /
- * `process.platform`. See #1635.
+ * Returns `false` on Windows because modern hosts (Windows Terminal, Tabby,
+ * Hyper, VS Code, Alacritty, and similar) are fronted by ConPTY. The kernel32
+ * `GetConsoleScreenBufferInfo` API answers about the pseudo-console — which is
+ * always pinned to its tail — and not about the user-visible scrollback. Treat
+ * Windows as unreportable so the renderer falls back to the deferred-rebuild
+ * path.
+ * Pure helper for unit testing. See #1635 and #1744.
  */
 export function shouldTrustNativeViewportProbe(
-	env: { WT_SESSION?: string | undefined } = $env,
-	platform: NodeJS.Platform = process.platform,
+	_env?: { WT_SESSION?: string | undefined },
+	_platform?: NodeJS.Platform,
 ): boolean {
-	if (platform !== "win32") return false;
-	if (env.WT_SESSION) return false;
-	return true;
+	return false;
 }
 
 /**

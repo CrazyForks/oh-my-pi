@@ -1559,6 +1559,26 @@ export class TUI extends Container {
 				return { kind: "historyRebuild" };
 			}
 			this.#markNativeScrollbackDirty();
+			// `deferredShrink` pads `newLines` with blanks at the tail so the
+			// viewport keeps its pre-shrink absolute indices. That only preserves
+			// the visible window when the diff sits inside (or just past) the
+			// previous viewport — pure trailing drops or in-viewport edits, where
+			// `newLines[i] === previousLines[i]` for every `i` above the change.
+			// An offscreen middle deletion (issue #1809: `deleteMiddle` at index
+			// 408 with the viewport at 1258..1263) shifts every row past the
+			// deletion up by `count`, so the padded slice rendered at the old
+			// viewport indices is the post-shift content (and a blank tail pad)
+			// instead of the rows the user is currently looking at. On an
+			// at-bottom reader that drifts the bottom-anchored tail off-screen
+			// (the failing stress oracle saw the entire visible window blanked).
+			// `deferredMutation` is a literal no-op: the terminal keeps the rows
+			// it already had — which are also the correct new bottom-anchored
+			// rows, because an offscreen deletion preserves the set of visible
+			// rows (only their absolute indices change). The next checkpoint
+			// rebuild reconciles scrollback.
+			if (diff.firstChanged < paddedViewportTop) {
+				return { kind: "deferredMutation" };
+			}
 			return { kind: "deferredShrink", paddedLength: this.#previousLines.length };
 		}
 

@@ -1937,6 +1937,58 @@ describe("TUI terminal-state regressions", () => {
 				tui.stop();
 			}
 		});
+
+		it("preserves bottom-anchored viewport across offscreen middle-shrink on unknown Windows viewport", async () => {
+			// Repro for #1809: `win32-unknown-small` stress scenario at seed=0x6b30c128
+			// blanked the entire visible window after a `deleteMiddle` at offscreen
+			// index 408. The renderer fell into the deferred-shrink fallback (line 1582
+			// of `tui.ts`) which pads `newLines` with blanks at the tail and repaints
+			// from `paddedLength - height`. That padding semantics only preserves the
+			// previous visible content for pure trailing shrinks; an offscreen middle
+			// deletion shifts every row past the deletion up by `count`, so the padded
+			// slice rendered at the old viewport indices ends up showing the post-shift
+			// content (and a blank tail pad) instead of the rows the user was looking
+			// at. The fix downgrades the fallback to `deferredMutation` when the diff
+			// starts above the previous viewport — a literal no-op preserves the visible
+			// rows, which are also the correct new bottom-anchored rows (offscreen
+			// deletion only renumbers their absolute indices).
+			const originalPlatform = process.platform;
+			Object.defineProperty(process, "platform", { configurable: true, value: "win32" });
+			const term = new UnknownViewportTerminal(32, 6);
+			const tui = new TUI(term);
+			const initial = rows("line-", 30);
+			const component = new MutableLinesComponent(initial);
+			tui.addChild(component);
+
+			try {
+				tui.start();
+				await settle(term);
+				// At-bottom in the simulator (no manual scroll); the renderer cannot
+				// observe this on win32-unknown.
+				const beforeViewport = visible(term).map(line => line.trim());
+				expect(beforeViewport).toEqual(["line-24", "line-25", "line-26", "line-27", "line-28", "line-29"]);
+
+				// Delete one offscreen row (index 5). The new frame's last six rows
+				// equal the old frame's last six rows (only their absolute indices shift).
+				const shrunk = [...initial.slice(0, 5), ...initial.slice(6)];
+				component.setLines(shrunk);
+				tui.requestRender(true, { allowUnknownViewportMutation: true });
+				await settle(term);
+
+				expect(visible(term).map(line => line.trim())).toEqual([
+					"line-24",
+					"line-25",
+					"line-26",
+					"line-27",
+					"line-28",
+					"line-29",
+				]);
+			} finally {
+				Object.defineProperty(process, "platform", { configurable: true, value: originalPlatform });
+				tui.stop();
+			}
+		});
+
 		it("defers bottom-anchored shrink when POSIX viewport state is unknown", async () => {
 			// Repro for #1566 follow-up (kitty/Linux): a bottom-anchored shrink across the
 			// viewport boundary used to fall through to `viewportRepaint`, which redrew the

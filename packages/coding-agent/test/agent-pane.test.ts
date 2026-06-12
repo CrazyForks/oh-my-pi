@@ -266,6 +266,49 @@ describe("pane protocol and client", () => {
 		stream.close();
 	});
 
+	it("keeps the pane usable after a typed pre-dispatch send rejection", async () => {
+		const stream = eventStream();
+		const client = new AgentPaneClient(permission, {
+			fetch: fixtureFetch((url, init) => {
+				if (url.pathname === "/v1/snapshot") return json(snapshot);
+				if (url.pathname === "/v1/transcript")
+					return json({
+						version: 1,
+						generation: permission.generation,
+						childId: permission.childId,
+						fromByte: 0,
+						nextByte: 0,
+						reset: false,
+						entries: [],
+					});
+				if (url.pathname === "/v1/stream") return stream.response;
+				if (url.pathname === "/v1/send") {
+					const commandId = (JSON.parse(String(init.body)) as { commandId: string }).commandId;
+					return json(
+						{
+							version: AGENT_CONTROL_PROTOCOL_VERSION,
+							generation: permission.generation,
+							childId: permission.childId,
+							commandId,
+							result: { ok: false, code: "unavailable", message: "send queue full" },
+						},
+						503,
+					);
+				}
+				return json({ error: "not_found" }, 404);
+			}),
+		});
+
+		await client.start();
+		const result = await client.send("continue once");
+		expect(result?.result).toEqual({ ok: false, code: "unavailable", message: "send queue full" });
+		expect(client.state.connection).toBe("connected");
+		expect(client.state.notice).toBe("send queue full");
+		expect(client.canSend).toBe(true);
+		client.close();
+		stream.close();
+	});
+
 	it("closes the viewer without sending an agent mutation", async () => {
 		let sends = 0;
 		const stream = eventStream();
@@ -325,7 +368,7 @@ describe("pane TUI", () => {
 	it("renders text-labelled connection, capability, outcome, sanitized transcript, and legal actions", () => {
 		const component = new AgentPaneComponent(
 			() => 12,
-			() => {},
+			() => true,
 			() => {},
 		);
 		component.setState(state("connected"));
@@ -348,6 +391,7 @@ describe("pane TUI", () => {
 			() => 8,
 			value => {
 				sent = value;
+				return true;
 			},
 			() => {},
 		);
@@ -374,7 +418,7 @@ describe("pane TUI", () => {
 	it("distinguishes running, revivable, terminal, reconnecting, unknown-outcome, and parent-loss states in text", () => {
 		const component = new AgentPaneComponent(
 			() => 12,
-			() => {},
+			() => true,
 			() => {},
 		);
 		const cases: Array<{ state: AgentPaneState; labels: string[] }> = [
@@ -411,7 +455,10 @@ describe("pane TUI", () => {
 		const sends: string[] = [];
 		const component = new AgentPaneComponent(
 			() => 10,
-			value => sends.push(value),
+			value => {
+				sends.push(value);
+				return true;
+			},
 			() => {},
 		);
 		component.setState(state("reconnecting", "running", "send"));
@@ -421,6 +468,20 @@ describe("pane TUI", () => {
 		component.setState(state("connected", "idle", "send"));
 		component.handleInput("\r");
 		expect(sends).toEqual(["preserved draft"]);
+	});
+
+	it("restores the submitted draft when the sidecar rejects before dispatch", async () => {
+		const component = new AgentPaneComponent(
+			() => 10,
+			() => false,
+			() => {},
+		);
+		component.setState(state("connected", "idle", "send"));
+		component.handleInput("retry later");
+		component.handleInput("\r");
+		await Promise.resolve();
+
+		expect(component.render(60).join("\n")).toContain("retry later");
 	});
 });
 

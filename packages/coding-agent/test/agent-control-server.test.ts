@@ -163,4 +163,46 @@ describe("lazy authenticated agent control sidecar", () => {
 		expect(await first.json()).toEqual(await repeated.json());
 		expect(steers).toBe(1);
 	});
+
+	test("returns typed rejections for send capacity before dispatch", async () => {
+		const { events, registry, host } = setup();
+		host.acquire();
+		const pending = Promise.withResolvers<void>();
+		await admit(events, registry, host, "A", "/tmp/a.jsonl", {
+			steer: async () => pending.promise,
+		} as unknown as AgentSession);
+		const permission = host.createPermissionSet("A")!;
+		const requests = Array.from({ length: 17 }, (_, index) =>
+			fetch(`${host.endpoint}/v1/send`, {
+				method: "POST",
+				headers: { authorization: `Bearer ${permission.token}`, "content-type": "application/json" },
+				body: JSON.stringify({
+					version: 1,
+					commandId: `${permission.generation}:command-${index}`,
+					prompt: `continue ${index}`,
+				}),
+			}),
+		);
+		const rejected = await Promise.any(
+			requests.map(async request => {
+				const response = await request;
+				if (response.status !== 503) throw new Error(`unexpected status ${response.status}`);
+				return response;
+			}),
+		);
+		const body = await rejected.json();
+		if (!body || typeof body !== "object" || !("commandId" in body)) {
+			throw new Error("typed send rejection omitted commandId");
+		}
+		pending.resolve();
+		await Promise.all(requests);
+
+		expect(body).toMatchObject({
+			version: 1,
+			generation: permission.generation,
+			childId: permission.childId,
+			result: { ok: false, code: "unavailable", message: "Agent pane send queue is full. Try again." },
+		});
+		expect(String(body.commandId)).toStartWith(`${permission.generation}:command-`);
+	});
 });

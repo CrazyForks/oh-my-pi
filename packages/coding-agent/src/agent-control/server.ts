@@ -2,7 +2,7 @@ import type { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import type { AgentRegistry } from "../registry/agent-registry";
 import type { AgentSession } from "../session/agent-session";
 import type { EventBus } from "../utils/event-bus";
-import type { DirectChildControlAdmission, DirectChildControlSource } from "./control";
+import type { ChildControlErrorCode, DirectChildControlAdmission, DirectChildControlSource } from "./control";
 import { DirectChildProjection, type ProjectionListener } from "./projection";
 import {
 	AGENT_CONTROL_PROTOCOL_VERSION,
@@ -48,6 +48,21 @@ function response(status: number, body?: unknown, headers: Record<string, string
 			...headers,
 		},
 	});
+}
+
+function sendRejection(
+	permission: PermissionRecord,
+	commandId: string,
+	code: ChildControlErrorCode,
+	message: string,
+): SendResultDTO {
+	return {
+		version: AGENT_CONTROL_PROTOCOL_VERSION,
+		generation: permission.generation,
+		childId: permission.childId,
+		commandId,
+		result: { ok: false, code, message },
+	};
 }
 
 export interface AgentControlServerHandle {
@@ -259,8 +274,23 @@ export class AgentControlServer implements AgentControlServerHandle {
 
 		let result = permission.ledger.get(commandId);
 		if (!result) {
-			if (permission.ledger.size >= MAX_LEDGER_RESULTS) return response(503, { error: "command_ledger_capacity" });
-			if (this.#queuedSends >= MAX_QUEUED_SENDS) return response(503, { error: "send_capacity" });
+			if (permission.ledger.size >= MAX_LEDGER_RESULTS) {
+				return response(
+					503,
+					sendRejection(
+						permission,
+						commandId,
+						"unavailable",
+						"Agent pane command ledger is full. Reconnect the pane and try again.",
+					),
+				);
+			}
+			if (this.#queuedSends >= MAX_QUEUED_SENDS) {
+				return response(
+					503,
+					sendRejection(permission, commandId, "unavailable", "Agent pane send queue is full. Try again."),
+				);
+			}
 			this.#queuedSends += 1;
 			result = projection
 				.send(permission.childId, prompt)

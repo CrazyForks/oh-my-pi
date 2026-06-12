@@ -258,7 +258,15 @@ export class AgentPaneClient {
 					this.#permanent(response.status === 401 ? "revoked" : "generation_closed");
 					return undefined;
 				}
-				// A timeout or transport/server error after dispatch is ambiguous. Never retry it.
+				if (response.status !== 504) {
+					const rejected = await this.#sendRejection(response, commandId);
+					if (rejected) {
+						const rejectedResult = rejected.result;
+						this.#notice = rejectedResult.ok ? "Command rejected." : sanitizeDisplay(rejectedResult.message);
+						return rejected;
+					}
+				}
+				// A timeout or untyped transport/server error after dispatch is ambiguous. Never retry it.
 				this.#freezeOutcomeUnknown(commandId);
 				return undefined;
 			}
@@ -468,6 +476,19 @@ export class AgentPaneClient {
 		else this.#permanent("parent_lost");
 	}
 
+	async #sendRejection(response: Response, commandId: string): Promise<SendResultDTO | undefined> {
+		let result: SendResultDTO;
+		try {
+			result = await this.#json<SendResultDTO>(response);
+		} catch {
+			return undefined;
+		}
+		if (!samePermission(this.permission, result) || !isSendResult(result, commandId) || result.result.ok) {
+			return undefined;
+		}
+		return result;
+	}
+
 	#freezeOutcomeUnknown(commandId: string): void {
 		if (this.#closed) return;
 		this.#connection = "outcome_unknown";
@@ -530,7 +551,7 @@ interface TranscriptAnchor {
 export class AgentPaneComponent implements Component, Focusable {
 	focused = false;
 	readonly #getRows: () => number;
-	readonly #onSend: (prompt: string) => void;
+	readonly #onSend: (prompt: string) => boolean | Promise<boolean>;
 	readonly #onClose: () => void;
 	readonly #editor: Editor;
 	readonly #scroll = new ScrollView([], { height: 1, scrollbar: "auto" });
@@ -543,7 +564,7 @@ export class AgentPaneComponent implements Component, Focusable {
 	#newOutput = 0;
 	#canSend = false;
 
-	constructor(getRows: () => number, onSend: (prompt: string) => void, onClose: () => void) {
+	constructor(getRows: () => number, onSend: (prompt: string) => boolean | Promise<boolean>, onClose: () => void) {
 		this.#getRows = getRows;
 		this.#onSend = onSend;
 		this.#onClose = onClose;
@@ -552,8 +573,17 @@ export class AgentPaneComponent implements Component, Focusable {
 		this.#editor.setPromptGutter("> ");
 		this.#editor.setMaxHeight(5);
 		this.#editor.onSubmit = text => {
-			if (this.#canSend && text.trim()) this.#onSend(text);
-			else this.#editor.setText(text);
+			if (!this.#canSend || !text.trim()) {
+				this.#editor.setText(text);
+				return;
+			}
+			void Promise.resolve(this.#onSend(text))
+				.then(accepted => {
+					if (!accepted && !this.#editor.getText()) this.#editor.setText(text);
+				})
+				.catch(() => {
+					if (!this.#editor.getText()) this.#editor.setText(text);
+				});
 		};
 	}
 
@@ -702,8 +732,9 @@ export async function runAgentPane(permission: ChildPermissionSet): Promise<void
 	};
 	const component = new AgentPaneComponent(
 		() => ui.terminal.rows,
-		prompt => {
-			void client.send(prompt);
+		async prompt => {
+			const result = await client.send(prompt);
+			return result === undefined || result.result.ok;
 		},
 		finish,
 	);

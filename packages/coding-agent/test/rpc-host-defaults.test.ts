@@ -105,6 +105,7 @@ describe("RPC host-defaulted settings", () => {
 		await Bun.write(path.join(agentDir, "config.yml"), configText);
 		resetSettingsForTest();
 		const settings = await Settings.init({ agentDir, cwd: root });
+		const previousNoTitle = Bun.env.PI_NO_TITLE;
 		const authStorage = await AuthStorage.create(path.join(root, "auth.db"));
 		let observed: ObservedSettingsSnapshot | undefined;
 		const stopMessage = "stop after settings observation";
@@ -147,6 +148,11 @@ describe("RPC host-defaulted settings", () => {
 			}
 		} finally {
 			authStorage.close();
+			if (previousNoTitle === undefined) {
+				delete Bun.env.PI_NO_TITLE;
+			} else {
+				Bun.env.PI_NO_TITLE = previousNoTitle;
+			}
 			resetSettingsForTest();
 		}
 

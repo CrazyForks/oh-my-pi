@@ -52,7 +52,7 @@ export async function getExistingSecretPlaceholderKey(): Promise<string | undefi
 	const keyPath = path.join(getConfigRootDir(), "secret-placeholder.key");
 	const cached = cachedPlaceholderKeys.get(keyPath);
 	if (cached !== undefined) return cached;
-	const existing = await readPlaceholderKeyFile(keyPath, false);
+	const existing = await readPlaceholderKeyFile(keyPath, true);
 	if (existing !== undefined) cachedPlaceholderKeys.set(keyPath, existing);
 	return existing;
 }

@@ -7,7 +7,11 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import type { Context, Message } from "@oh-my-pi/pi-ai";
-import { getSecretPlaceholderKey, loadSecrets } from "@oh-my-pi/pi-coding-agent/secrets";
+import {
+	getExistingSecretPlaceholderKey,
+	getSecretPlaceholderKey,
+	loadSecrets,
+} from "@oh-my-pi/pi-coding-agent/secrets";
 import {
 	obfuscateMessages,
 	obfuscateProviderContext,
@@ -214,6 +218,20 @@ describe("getSecretPlaceholderKey", () => {
 			await expect(getSecretPlaceholderKey()).rejects.toThrow("secret placeholder key");
 		});
 	});
+
+	it("retries empty existing placeholder key files without creating a new one", async () => {
+		await withTempConfigRoot(async () => {
+			setProfile("race");
+			await fs.mkdir(getConfigRootDir(), { recursive: true });
+			const keyPath = path.join(getConfigRootDir(), "secret-placeholder.key");
+			await fs.writeFile(keyPath, "");
+			const eventualKey = "C".repeat(43);
+			const writer = Bun.sleep(25).then(() => fs.writeFile(keyPath, eventualKey));
+
+			await expect(getExistingSecretPlaceholderKey()).resolves.toBe(eventualKey);
+			await writer;
+		});
+	});
 });
 
 describe("SecretObfuscator friendlyName placeholders", () => {
@@ -289,6 +307,30 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(obfuscated).not.toBe("REDACTED");
 		expect(obfuscated).toMatch(/^#[A-Z0-9]+:L#$/);
 		expect(obfuscator.deobfuscate(obfuscated)).toBe("abc");
+	});
+
+	it("does not recursively rewrite plain secrets that look like placeholders", () => {
+		const sharedKey = "D".repeat(43);
+		const firstOnly = new SecretObfuscator(
+			[{ type: "plain", content: "legacy-secret", friendlyName: "old" }],
+			sharedKey,
+		);
+		const firstPlaceholder = firstOnly.obfuscate("legacy-secret");
+		const secondOnly = new SecretObfuscator(
+			[{ type: "plain", content: firstPlaceholder, friendlyName: "other" }],
+			sharedKey,
+		);
+		const secondPlaceholder = secondOnly.obfuscate(firstPlaceholder);
+		const obfuscator = new SecretObfuscator(
+			[
+				{ type: "plain", content: "legacy-secret", friendlyName: "old" },
+				{ type: "plain", content: firstPlaceholder, friendlyName: "other" },
+			],
+			sharedKey,
+		);
+
+		expect(secondPlaceholder).toMatch(/^#OTHER_[A-Z0-9]+(?::[ULCM])?#$/);
+		expect(obfuscator.deobfuscate(secondPlaceholder)).toBe(firstPlaceholder);
 	});
 
 	it("keeps no-name placeholders unprefixed but content-derived", () => {

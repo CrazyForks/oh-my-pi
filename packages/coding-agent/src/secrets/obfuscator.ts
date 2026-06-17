@@ -189,8 +189,8 @@ export class SecretObfuscator {
 	/** Replace-mode plain mappings: secret → replacement */
 	#replaceMappings = new Map<string, string>();
 
-	/** Reverse lookup for deobfuscation: placeholder → secret */
-	#deobfuscateMap = new Map<string, string>();
+	/** Reverse lookup for deobfuscation: placeholder → secret plus recursion policy. */
+	#deobfuscateMap = new Map<string, { secret: string; recursive: boolean }>();
 
 	/** Placeholder base-key (exact value for :M, case-folded otherwise) → base hash. */
 	#placeholderBaseByKey = new Map<string, string>();
@@ -222,7 +222,7 @@ export class SecretObfuscator {
 			if (entry.type === "plain") {
 				if (mode === "obfuscate") {
 					const placeholder = this.#createPlaceholder(entry.content, entry.friendlyName);
-					this.#registerDeobfuscationAlias(buildLegacyPlaceholder(index), entry.content);
+					this.#registerDeobfuscationAlias(buildLegacyPlaceholder(index), entry.content, false);
 					this.#plainMappings.set(entry.content, index);
 					this.#obfuscateMappings.set(index, { secret: entry.content, placeholder });
 					index++;
@@ -285,7 +285,7 @@ export class SecretObfuscator {
 					let index = this.#findObfuscateIndex(match.value);
 					if (index === undefined) {
 						index = this.#nextIndex++;
-						const placeholder = this.#createPlaceholder(match.value, entry.friendlyName);
+						const placeholder = this.#createPlaceholder(match.value, entry.friendlyName, true);
 						this.#obfuscateMappings.set(index, { secret: match.value, placeholder });
 					}
 					const mapping = this.#obfuscateMappings.get(index)!;
@@ -302,17 +302,24 @@ export class SecretObfuscator {
 		if (!this.#hasAny || !text.includes("#")) return text;
 		let result = text;
 		for (;;) {
+			let shouldContinue = false;
 			const next = result.replace(PLACEHOLDER_RE, match => {
 				const direct = this.#deobfuscateMap.get(match);
-				if (direct !== undefined) return direct;
+				if (direct !== undefined) {
+					shouldContinue ||= direct.recursive;
+					return direct.secret;
+				}
 				const unprefixed = placeholderWithoutFriendlyName(match);
 				if (unprefixed) {
 					const mapped = this.#deobfuscateMap.get(unprefixed);
-					if (mapped !== undefined) return mapped;
+					if (mapped !== undefined) {
+						shouldContinue ||= mapped.recursive;
+						return mapped.secret;
+					}
 				}
 				return match;
 			});
-			if (next === result || !next.includes("#")) return next;
+			if (next === result || !shouldContinue || !next.includes("#")) return next;
 			result = next;
 		}
 	}
@@ -342,7 +349,7 @@ export class SecretObfuscator {
 		return undefined;
 	}
 
-	#createPlaceholder(secret: string, friendlyName?: string): string {
+	#createPlaceholder(secret: string, friendlyName?: string, recursive: boolean = false): string {
 		const hint = inferCaseHint(secret);
 		// `:M` does not encode the exact case pattern, so two distinct mixed-case
 		// values can share a case-folded base + hint. Key those on the exact value
@@ -354,7 +361,7 @@ export class SecretObfuscator {
 		const preferredBase = this.#resolvePreferredPlaceholderBase(baseKey);
 		const preferredPlaceholder = buildPlaceholder(hint, preferredBase, sanitizedFriendlyName);
 		if (!this.#placeholderConflicts(preferredPlaceholder, secret)) {
-			this.#registerDeobfuscationAlias(preferredPlaceholder, secret);
+			this.#registerDeobfuscationAlias(preferredPlaceholder, secret, recursive);
 			return preferredPlaceholder;
 		}
 
@@ -362,7 +369,7 @@ export class SecretObfuscator {
 			const fallbackBase = this.#reserveFallbackPlaceholderBase(baseKey, attempt);
 			const placeholder = buildPlaceholder(hint, fallbackBase, sanitizedFriendlyName);
 			if (!this.#placeholderConflicts(placeholder, secret)) {
-				this.#registerDeobfuscationAlias(placeholder, secret);
+				this.#registerDeobfuscationAlias(placeholder, secret, recursive);
 				return placeholder;
 			}
 		}
@@ -395,7 +402,7 @@ export class SecretObfuscator {
 
 	#placeholderCollides(placeholder: string, secret: string): boolean {
 		const existing = this.#deobfuscateMap.get(placeholder);
-		return existing !== undefined && existing !== secret;
+		return existing !== undefined && existing.secret !== secret;
 	}
 
 	// A friendly placeholder is only safe if BOTH its full token and its
@@ -408,16 +415,16 @@ export class SecretObfuscator {
 		return unprefixed !== undefined && this.#placeholderCollides(unprefixed, secret);
 	}
 
-	#registerDeobfuscationAlias(placeholder: string, secret: string): void {
+	#registerDeobfuscationAlias(placeholder: string, secret: string, recursive: boolean): void {
 		const existing = this.#deobfuscateMap.get(placeholder);
-		if (existing === undefined || existing === secret) {
-			this.#deobfuscateMap.set(placeholder, secret);
+		if (existing === undefined || existing.secret === secret) {
+			this.#deobfuscateMap.set(placeholder, { secret, recursive });
 		}
 		const unprefixed = placeholderWithoutFriendlyName(placeholder);
 		if (unprefixed !== undefined) {
 			const existingUnprefixed = this.#deobfuscateMap.get(unprefixed);
-			if (existingUnprefixed === undefined || existingUnprefixed === secret) {
-				this.#deobfuscateMap.set(unprefixed, secret);
+			if (existingUnprefixed === undefined || existingUnprefixed.secret === secret) {
+				this.#deobfuscateMap.set(unprefixed, { secret, recursive });
 			}
 		}
 	}

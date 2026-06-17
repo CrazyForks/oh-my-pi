@@ -151,6 +151,7 @@ import type { ObservableSession } from "./session-observer-registry";
 import { SessionObserverRegistry } from "./session-observer-registry";
 import { runProviderSetupWizard } from "./setup-wizard/lazy";
 import { interruptHint } from "./shared";
+import { clearMermaidCache } from "./theme/mermaid-cache";
 import { type ShimmerPalette, shimmerEnabled, shimmerSegments, shimmerText } from "./theme/shimmer";
 import type { Theme } from "./theme/theme";
 import {
@@ -854,6 +855,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		onThemeChange(() => {
 			this.#clearWorkingMessageAccentCache();
 			clearRenderCache();
+			clearMermaidCache();
 			this.ui.invalidate();
 			this.updateEditorBorderColor();
 			this.ui.requestRender();
@@ -2177,7 +2179,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	#formatKeepContextLabel(contextUsage: ContextUsage | undefined): string {
-		if (contextUsage?.tokens == null) {
+		if (!contextUsage) {
 			return "Approve and keep context";
 		}
 		const tokens = formatContextTokenCount(contextUsage.tokens);
@@ -2186,7 +2188,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	#isKeepContextDisabled(contextUsage: ContextUsage | undefined): boolean {
-		return contextUsage?.percent != null && contextUsage.percent > PLAN_KEEP_CONTEXT_DISABLE_THRESHOLD_PERCENT;
+		return contextUsage !== undefined && contextUsage.percent > PLAN_KEEP_CONTEXT_DISABLE_THRESHOLD_PERCENT;
 	}
 
 	async #openPlanInExternalEditor(planFilePath: string): Promise<void> {
@@ -3382,8 +3384,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		return this.#commandController.handleExportCommand(text);
 	}
 
-	handleDumpCommand(isRaw?: boolean) {
-		return this.#commandController.handleDumpCommand(isRaw);
+	handleDumpCommand() {
+		return this.#commandController.handleDumpCommand();
 	}
 
 	handleAdvisorDumpCommand(isRaw?: boolean) {

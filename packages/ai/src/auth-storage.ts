@@ -1512,17 +1512,6 @@ export class AuthStorage {
 		this.#resetProviderAssignments(provider);
 	}
 
-	async #upsertOAuthCredential(provider: string, credential: OAuthCredential): Promise<void> {
-		const stored = this.#store.upsertAuthCredentialRemote
-			? await this.#store.upsertAuthCredentialRemote(provider, credential)
-			: this.#store.upsertAuthCredentialForProvider(provider, credential);
-		this.#setStoredCredentials(
-			provider,
-			stored.map(record => ({ id: record.id, credential: record.credential })),
-		);
-		this.#resetProviderAssignments(provider);
-	}
-
 	/**
 	 * List stored credential rows, optionally filtered by provider.
 	 */
@@ -1786,7 +1775,10 @@ export class AuthStorage {
 			return;
 		}
 		const newCredential: OAuthCredential = { type: "oauth", ...result };
-		await this.#upsertOAuthCredential(def.storeCredentialsAs ?? provider, newCredential);
+		// Use set() instead of #upsertOAuthCredential to replace ALL existing credentials
+		// (including legacy api_key rows from older versions) with the new OAuth credential.
+		// This ensures getApiKey() doesn't match an old api_key row before the new OAuth row.
+		await this.set(def.storeCredentialsAs ?? provider, newCredential);
 	}
 
 	/**

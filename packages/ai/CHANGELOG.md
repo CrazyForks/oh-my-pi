@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+## [16.1.0] - 2026-06-19
+
+### Added
+
+- Added utility functions to strip schema descriptions for optimized LLM context usage
+
 ## [16.0.10] - 2026-06-18
 
 ### Added

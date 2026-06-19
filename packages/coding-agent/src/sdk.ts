@@ -5,7 +5,6 @@ import {
 	type AgentTelemetryConfig,
 	type AgentTool,
 	AppendOnlyContextManager,
-	INTENT_FIELD,
 	type ThinkingLevel,
 } from "@oh-my-pi/pi-agent-core";
 import {
@@ -35,6 +34,7 @@ import {
 	prompt,
 	Snowflake,
 } from "@oh-my-pi/pi-utils";
+import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
 import { ADVISOR_READONLY_TOOL_NAMES, discoverWatchdogFiles } from "./advisor";
 import { type AsyncJob, AsyncJobManager } from "./async";
 import { AutoLearnController, buildAutoLearnInstructions } from "./autolearn/controller";
@@ -840,7 +840,7 @@ export interface BuildSystemPromptOptions {
 	contextFiles?: Array<{ path: string; content: string }>;
 	cwd?: string;
 	appendPrompt?: string;
-	repeatToolDescriptions?: boolean;
+	inlineToolDescriptors?: boolean;
 }
 
 /**
@@ -855,7 +855,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		skills: options.skills,
 		contextFiles: options.contextFiles,
 		appendSystemPrompt: options.appendPrompt,
-		repeatToolDescriptions: options.repeatToolDescriptions,
+		inlineToolDescriptors: options.inlineToolDescriptors,
 	});
 }
 
@@ -2146,7 +2146,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			emitEvent: event => cursorEventEmitter?.(event),
 		});
 
-		const repeatToolDescriptions = settings.get("repeatToolDescriptions");
+		const inlineToolDescriptors = settings.get("inlineToolDescriptors");
 		const eagerTasks = settings.get("task.eager") !== "default";
 		const eagerTasksAlways = settings.get("task.eager") === "always";
 		const intentField = $flag("PI_INTENT_TRACING", settings.get("tools.intentTracing")) ? INTENT_FIELD : undefined;
@@ -2214,7 +2214,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				}
 				appendPrompt = parts.join("\n\n");
 			}
-			// Owned/in-band tool dialect (non-native) repeats the catalog as `# Tool:`
+			// Owned/in-band tool dialects (non-native) require the catalog as `# Tool:`
 			// sections; native tool calling lets the compact name list suffice.
 			const nativeTools = resolveDialect(settings.get("tools.format"), agent?.state.model ?? model) === undefined;
 			const defaultPrompt = await buildSystemPromptInternal({
@@ -2227,7 +2227,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				alwaysApplyRules,
 				skillsSettings: settings.getGroup("skills"),
 				appendSystemPrompt: appendPrompt,
-				repeatToolDescriptions,
+				inlineToolDescriptors,
 				nativeTools,
 				intentField,
 				mcpDiscoveryMode: hasDiscoverableTools,
@@ -2552,9 +2552,10 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				return result;
 			},
 			intentTracing: !!intentField,
+			pruneToolDescriptions: inlineToolDescriptors,
 			dialect: resolveDialect(settings.get("tools.format"), model),
 			abortOnFabricatedToolResult: settings.get("tools.abortOnFabricatedResult"),
-			getToolChoice: () => session?.nextToolChoice(),
+			getToolChoice: () => session?.nextToolChoiceDirective(),
 			telemetry: options.telemetry,
 			appendOnlyContext: model
 				? shouldEnableAppendOnlyContext(settings.get("provider.appendOnlyContext"), model)
@@ -2622,6 +2623,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 		session = new AgentSession({
 			advisorWatchdogPrompt,
 			agent,
+			pruneToolDescriptions: inlineToolDescriptors,
 			thinkingLevel: autoThinking ? AUTO_THINKING : effectiveThinkingLevel,
 			sessionManager,
 			settings,

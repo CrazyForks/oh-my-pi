@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+## [16.1.0] - 2026-06-19
+
+### Added
+
+- `Box` now accepts an optional `border` (box-drawing glyphs + colorizer) and exposes `setBorder()`, drawing a colored outline around its padded/background content. The border is automatically dropped at widths too narrow to frame so a bordered box never overflows its given width.
+
+## [16.0.11] - 2026-06-19
+
+### Breaking Changes
+
+- Removed `getIndentation` and `getIndentationNoescape` exported utilities
+- Tab-related operations no longer respect per-file or globally configured indentation settings
+
+### Changed
+
+- Standardized tab expansion to use a fixed display width instead of configurable settings
+- Removed support for custom tab width configuration in text rendering and input handling
+
+### Fixed
+
+- Corrected logic in string truncation to prevent improper truncation of short strings
+- Fixed a one-frame transcript flash during a non-multiplexer resize drag: while the drag borrowed the alternate screen and painted only the viewport, any ordinary (non-forced) render from a still-animating block — a tool spinner tick, a streamed token, a cursor blink — fell through to the deferred geometry-rebuild full paint, which left the alternate screen to repaint the whole transcript on the normal screen for a single frame before the next SIGWINCH re-entered the viewport fast path, so a live tool block flashed in and vanished. Ordinary renders mid-drag now stay on the viewport fast path; only forced renders (tool finalization, reset, image reconciliation) still preempt it.
+
 ## [16.0.10] - 2026-06-18
 
 ### Fixed

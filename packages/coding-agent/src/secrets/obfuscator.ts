@@ -323,7 +323,6 @@ export class SecretObfuscator {
 					if (match.preserveGeneratedPlaceholders) {
 						if (
 							match.preserveInputPlaceholders &&
-							!match.inputPlaceholderOutsideIndependentlyMatches &&
 							entry.replacement === undefined &&
 							match.inputPlaceholderOutsideChunkCount === 1 &&
 							this.#generatedReplaceChunks.has(match.inputPlaceholderOutside)

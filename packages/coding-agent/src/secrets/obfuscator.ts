@@ -157,11 +157,14 @@ export function secretEntryNeedsPlaceholderKey(entry: SecretEntry): boolean {
  * `content` in that output is covered by interior replacement tiles (each a
  * substring of `content`) bordered by passthrough at the ends, where the border
  * tile may be a suffix of a replacement (forming `content`'s prefix) or a prefix
- * of a replacement (forming `content`'s suffix). So a replacement can help iff it
- * is a substring of `content`, contains `content`, or shares such a border overlap.
+ * of a replacement (forming `content`'s suffix). An EMPTY replacement deletes its
+ * trigger entirely, joining the passthrough on both sides; with adversary-chosen
+ * surrounding bytes that can form any non-empty `content` across the deleted gap.
+ * So a replacement can help iff it is empty, is a substring of `content`,
+ * contains `content`, or shares such a border overlap.
  */
 function replacementCanFormContent(replacement: string, content: string): boolean {
-	if (replacement.length === 0) return false;
+	if (replacement.length === 0) return content.length > 0;
 	if (content.includes(replacement) || replacement.includes(content)) return true;
 	const maxOverlap = Math.min(replacement.length, content.length);
 	for (let k = 1; k <= maxOverlap; k++) {

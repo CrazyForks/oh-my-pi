@@ -859,6 +859,16 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		];
 		expect(secretEntriesNeedPlaceholderKey(fragmentJoin)).toBe(true);
 		expect(new SecretObfuscator(fragmentJoin, "test-placeholder-key").obfuscate("x ARET12 y")).toMatch(/#[A-Z0-9]/);
+		// A delete replacement also joins the passthrough bytes on both sides of the
+		// removed token, so it can reconstruct the obfuscate content even though its
+		// replacement output is empty.
+		const deleteJoin: SecretEntry[] = [
+			{ type: "plain", content: "SECRET12", mode: "obfuscate" },
+			{ type: "plain", content: "SECRET12", mode: "replace", replacement: "SAFE" },
+			{ type: "plain", content: "X", mode: "replace", replacement: "" },
+		];
+		expect(secretEntriesNeedPlaceholderKey(deleteJoin)).toBe(true);
+		expect(new SecretObfuscator(deleteJoin, "test-placeholder-key").obfuscate("SECRETX12")).toMatch(/#[A-Z0-9]/);
 	});
 
 	it("redacts a raw sentinel-shaped suffix bridged into a match by a prior placeholder", () => {

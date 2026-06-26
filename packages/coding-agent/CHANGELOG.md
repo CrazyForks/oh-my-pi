@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed MCP stdio servers spawning a visible console window on Windows whenever the resolved command was a `.exe` (node-based servers, absolute `.exe` paths). `StdioTransport.connect()` started passing `detached: true` to defeat terminal job-control signals, but `resolveStdioSpawnCommand`'s direct-spawn fast path returned no `windowsHide` — and on Windows `detached: true` allocates a new console unless `windowsHide: true` rides along. The cmd.exe wrap path was unaffected because it already set the flag. `resolveStdioSpawnCommand` now sets `windowsHide: true` on every win32 return shape. ([#3519](https://github.com/can1357/oh-my-pi/issues/3519))
+
 ## [16.1.20] - 2026-06-25
 
 ### Fixed

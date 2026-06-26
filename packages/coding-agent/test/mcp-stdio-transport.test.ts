@@ -319,6 +319,44 @@ describe("resolveStdioSpawnCommand", () => {
 		expect(result.windowsHide).toBe(true);
 	});
 
+	it("sets windowsHide on the .exe direct-spawn fast path so detached MCP servers stay headless (#3519)", async () => {
+		// `StdioTransport.connect()` spawns with `detached: true` to escape terminal
+		// job-control signals. On Windows that flag allocates a new console unless
+		// `windowsHide: true` rides along. The cmd.exe wrap path always set the flag,
+		// but the direct-spawn fast path for resolved .exe binaries (node-based
+		// servers, absolute .exe commands) used to drop it — popping a visible
+		// console for the lifetime of the session. Pin the flag on both shapes.
+		const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "omp-mcp-exe-hide-"));
+		try {
+			const exe = path.join(tempDir, "server.exe");
+			await Bun.write(exe, "MZ");
+
+			const bare = await resolveStdioSpawnCommand(
+				{ type: "stdio", command: "server", args: ["--port", "1234"] },
+				{
+					cwd: tempDir,
+					env: { COMSPEC: "C:\\Windows\\System32\\cmd.exe", PATH: tempDir, PATHEXT: ".exe" },
+					platform: "win32",
+				},
+			);
+			expect(bare.cmd).toEqual([exe, "--port", "1234"]);
+			expect(bare.windowsHide).toBe(true);
+
+			const absolute = await resolveStdioSpawnCommand(
+				{ type: "stdio", command: exe },
+				{
+					cwd: tempDir,
+					env: { COMSPEC: "C:\\Windows\\System32\\cmd.exe", PATHEXT: ".exe" },
+					platform: "win32",
+				},
+			);
+			expect(absolute.cmd).toEqual([exe]);
+			expect(absolute.windowsHide).toBe(true);
+		} finally {
+			await fs.rm(tempDir, { recursive: true, force: true });
+		}
+	});
+
 	it("leaves non-Windows commands untouched", async () => {
 		const result = await resolveStdioSpawnCommand(
 			{ type: "stdio", command: "codegraph", args: ["serve", "--mcp"] },

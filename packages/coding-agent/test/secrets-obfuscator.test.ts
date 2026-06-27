@@ -789,6 +789,20 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(obf.obfuscate(out)).toBe(out);
 	});
 
+	it("samples every leading character class before giving up on three-character collisions", () => {
+		const obf = new SecretObfuscator(
+			[{ type: "regex", mode: "replace", content: "[A-Za-z0-9].{2}" }],
+			"Q".repeat(43),
+		);
+
+		const out = obf.obfuscate("ZZc");
+
+		expect(out).not.toBe("ZZc");
+		expect(out).toHaveLength(3);
+		expect(/[A-Za-z0-9].{2}/.test(out)).toBe(false);
+		expect(obf.obfuscate(out)).toBe(out);
+	});
+
 	it("keeps the sentinel only when no same-length value avoids the regex", () => {
 		// A match-everything regex has no nonmatching same-length redaction, so the
 		// search exhausts and the sentinel is kept as the sole fixed point. Such a

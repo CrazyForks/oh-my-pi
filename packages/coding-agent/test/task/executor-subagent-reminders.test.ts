@@ -7,7 +7,11 @@ import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import type { AgentSession, AgentSessionEvent, PromptOptions } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
-import { runSubprocess, SUBAGENT_WARNING_MISSING_YIELD } from "@oh-my-pi/pi-coding-agent/task/executor";
+import {
+	finalizeSubprocessOutput,
+	runSubprocess,
+	SUBAGENT_WARNING_MISSING_YIELD,
+} from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { logger } from "@oh-my-pi/pi-utils";
@@ -39,7 +43,7 @@ function createMockSession(
 		promptIndex: number;
 		emit: (event: AgentSessionEvent) => void;
 		state: { messages: AssistantMessage[] };
-	}) => void,
+	}) => void | Promise<void>,
 ): AgentSession {
 	const listeners: Array<(event: AgentSessionEvent) => void> = [];
 	const state = { messages: [] as AssistantMessage[] };
@@ -68,7 +72,7 @@ function createMockSession(
 		},
 		prompt: async (text: string, options?: PromptOptions) => {
 			promptIndex += 1;
-			onPrompt({ text, options, promptIndex, emit, state });
+			await onPrompt({ text, options, promptIndex, emit, state });
 		},
 		waitForIdle: async () => {},
 		getLastAssistantMessage: () => state.messages[state.messages.length - 1],
@@ -335,6 +339,98 @@ describe("runSubprocess yield reminders", () => {
 		expect(prompts).toHaveLength(2);
 		expect(result.exitCode).toBe(0);
 		expect(result.output).toContain('"ok": true');
+	});
+
+	it("waits for yield-triggered abort cleanup before resolving the subagent", async () => {
+		const promptCleanup = Promise.withResolvers<void>();
+		const abortCleanup = Promise.withResolvers<void>();
+		const validYieldEmitted = Promise.withResolvers<void>();
+		let abortCalls = 0;
+		const session = createMockSession(async ({ promptIndex, emit, state }) => {
+			if (promptIndex === 1) {
+				const assistant = createAssistantStopMessage("malformed yield attempt");
+				state.messages.push(assistant);
+				emit({ type: "message_end", message: assistant });
+				emit({
+					type: "tool_execution_end",
+					toolCallId: "tool-malformed",
+					toolName: "yield",
+					result: {
+						content: [{ type: "text", text: "result must be an object containing either data or error" }],
+						details: { status: "error", error: "result must be an object containing either data or error" },
+					},
+					isError: true,
+				});
+				return;
+			}
+
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "tool-success-after-malformed",
+				toolName: "yield",
+				result: {
+					content: [{ type: "text", text: "Result submitted." }],
+					details: { status: "success", data: { ok: true } },
+				},
+				isError: false,
+			});
+			validYieldEmitted.resolve();
+			await promptCleanup.promise;
+		});
+		(session as unknown as { abort: () => Promise<void> }).abort = async () => {
+			abortCalls += 1;
+			promptCleanup.resolve();
+			await abortCleanup.promise;
+		};
+
+		mockCreateAgentSession(session);
+
+		let settled = false;
+		const resultPromise = runSubprocess({ ...baseOptions, id: "subagent-yield-abort-cleanup" }).finally(() => {
+			settled = true;
+		});
+
+		await validYieldEmitted.promise;
+		await Bun.sleep(20);
+		expect(abortCalls).toBe(1);
+		expect(settled).toBe(false);
+
+		abortCleanup.resolve();
+		const result = await resultPromise;
+		expect(result.exitCode).toBe(0);
+		expect(result.output).toContain('"ok": true');
+	});
+
+	it("keeps a real run failure from being masked by a successful yield", () => {
+		const result = finalizeSubprocessOutput({
+			rawOutput: "partial output",
+			exitCode: 1,
+			stderr: "Provider returned error finish_reason",
+			doneAborted: false,
+			signalAborted: false,
+			yieldItems: [{ status: "success", data: { ok: true } }],
+			outputSchema: undefined,
+		});
+
+		expect(result.exitCode).toBe(1);
+		expect(result.stderr).toBe("Provider returned error finish_reason");
+		expect(result.rawOutput).toContain('"ok": true');
+	});
+
+	it("lets a valid yield clear internal termination without stderr", () => {
+		const result = finalizeSubprocessOutput({
+			rawOutput: "",
+			exitCode: 1,
+			stderr: "",
+			doneAborted: true,
+			signalAborted: false,
+			yieldItems: [{ status: "success", data: { ok: true } }],
+			outputSchema: undefined,
+		});
+
+		expect(result.exitCode).toBe(0);
+		expect(result.stderr).toBe("");
+		expect(result.rawOutput).toContain('"ok": true');
 	});
 	it("uses provided thinking level when model override has no explicit suffix", async () => {
 		vi.clearAllMocks();

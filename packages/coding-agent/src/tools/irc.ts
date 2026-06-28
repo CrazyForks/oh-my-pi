@@ -13,13 +13,13 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 import type { ToolExample } from "@oh-my-pi/pi-ai";
 import { type Component, Text } from "@oh-my-pi/pi-tui";
 import { formatAge, formatDuration, prompt } from "@oh-my-pi/pi-utils";
-import { z } from "zod/v4";
+import { type } from "arktype";
 import type { Settings } from "../config/settings";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { IrcBus, type IrcDeliveryReceipt, type IrcMessage } from "../irc/bus";
 import type { Theme } from "../modes/theme/theme";
 import ircDescription from "../prompts/tools/irc.md" with { type: "text" };
-import type { AgentRegistry } from "../registry/agent-registry";
+import { type AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { canSpawnAtDepth } from "../task/types";
 import { Ellipsis, renderStatusLine, renderTreeList, truncateToWidth } from "../tui";
 import type { ToolSession } from ".";
@@ -49,18 +49,18 @@ export function isIrcEnabled(settings: Settings, taskDepth: number): boolean {
 	return canSpawnAtDepth(maxDepth, taskDepth);
 }
 
-const ircSchema = z.object({
-	op: z.enum(["send", "wait", "inbox", "list"]).describe("irc operation"),
-	to: z.string().optional().describe('send: recipient agent id or "all"'),
-	message: z.string().optional().describe("send: message body"),
-	replyTo: z.string().optional().describe("send: message id being answered"),
-	await: z.boolean().optional().describe('send: wait for the recipient\'s reply (invalid with to:"all")'),
-	from: z.string().optional().describe("wait: only accept a message from this agent id"),
-	timeoutMs: z.number().optional().describe("wait: timeout in milliseconds (0 waits indefinitely)"),
-	peek: z.boolean().optional().describe("inbox: list messages without consuming them"),
+const ircSchema = type({
+	op: type("'send' | 'wait' | 'inbox' | 'list'").describe("irc operation"),
+	"to?": type("string").describe('send: recipient agent id or "all"'),
+	"message?": type("string").describe("send: message body"),
+	"replyTo?": type("string").describe("send: message id being answered"),
+	"await?": type("boolean").describe('send: wait for the recipient\'s reply (invalid with to:"all")'),
+	"from?": type("string").describe("wait: only accept a message from this agent id"),
+	"timeoutMs?": type("number").describe("wait: timeout in milliseconds (0 waits indefinitely)"),
+	"peek?": type("boolean").describe("inbox: list messages without consuming them"),
 });
 
-type IrcParams = z.infer<typeof ircSchema>;
+type IrcParams = typeof ircSchema.infer;
 
 interface IrcPeerInfo {
 	id: string;
@@ -98,7 +98,7 @@ export class IrcTool implements AgentTool<typeof ircSchema, IrcDetails> {
 	readonly parameters = ircSchema;
 	readonly strict = true;
 
-	readonly examples: readonly ToolExample<z.input<typeof ircSchema>>[] = [
+	readonly examples: readonly ToolExample<typeof ircSchema.infer>[] = [
 		{
 			caption: "List peers",
 			call: { op: "list" },
@@ -182,7 +182,7 @@ export class IrcTool implements AgentTool<typeof ircSchema, IrcDetails> {
 		const bus = IrcBus.global();
 		const peers = registry
 			.list()
-			.filter(ref => ref.id !== senderId && ref.status !== "aborted")
+			.filter(ref => ref.id !== senderId && ref.status !== "aborted" && ref.kind !== "advisor")
 			.map(ref => ({
 				id: ref.id,
 				displayName: ref.displayName,
@@ -280,6 +280,10 @@ export class IrcTool implements AgentTool<typeof ircSchema, IrcDetails> {
 			// parked agent on a broadcast would be a stampede. Direct sends go
 			// through the bus unfiltered so parked recipients are revived.
 			const targets = isBroadcast ? registry.listVisibleTo(senderId).map(ref => ref.id) : [to];
+			// A broadcast that also reaches the main agent delivers the body to it
+			// directly (its own incoming card); relaying the sibling legs to the
+			// main UI would then show the same body once per other recipient.
+			const suppressRelay = isBroadcast && targets.includes(MAIN_AGENT_ID);
 			const receipts = await Promise.all(
 				targets.map(target =>
 					bus.send(
@@ -287,7 +291,7 @@ export class IrcTool implements AgentTool<typeof ircSchema, IrcDetails> {
 						// Awaited sends mark the sender as blocked on an answer so a
 						// busy recipient that cannot reach a step boundary (async
 						// disabled) auto-replies instead of stranding the sender.
-						params.await ? { expectsReply: true } : undefined,
+						{ expectsReply: params.await || undefined, suppressRelay: suppressRelay || undefined },
 					),
 				),
 			);
@@ -512,6 +516,18 @@ function callMeta(args: IrcRenderArgs | undefined): string[] {
 	if (args?.op === "wait" && args.timeoutMs) meta.push(`timeout ${formatDuration(args.timeoutMs)}`);
 	if (args?.op === "inbox" && args.peek) meta.push("peek");
 	return meta;
+}
+
+function renderErrorResult(
+	result: { content: Array<{ type: string; text?: string }> },
+	args: IrcRenderArgs | undefined,
+	theme: Theme,
+): string[] {
+	const text = textContent(result) || "IRC call failed.";
+	return [
+		renderStatusLine({ icon: "error", title: callTitle(args, theme), meta: callMeta(args) }, theme),
+		formatErrorDetail(text, theme),
+	];
 }
 
 /**
@@ -743,9 +759,11 @@ function buildResultLines(
 		case "wait":
 			return renderWaitResult(result, details, args, expanded, theme);
 		case "inbox":
-			return renderInboxResult(details, args, expanded, theme);
+			return result.isError
+				? renderErrorResult(result, args, theme)
+				: renderInboxResult(details, args, expanded, theme);
 		case "list":
-			return renderListResult(details, expanded, theme);
+			return result.isError ? renderErrorResult(result, args, theme) : renderListResult(details, expanded, theme);
 		default: {
 			const text = textContent(result) || (result.isError ? "IRC call failed." : "Done.");
 			return [

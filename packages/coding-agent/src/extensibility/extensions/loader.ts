@@ -8,7 +8,8 @@ import type { ThinkingLevel } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, Model, TextContent, TSchema } from "@oh-my-pi/pi-ai";
 import type { KeyId } from "@oh-my-pi/pi-tui";
 import { hasFsCode, isEacces, isEnoent, logger } from "@oh-my-pi/pi-utils";
-import { z } from "zod/v4";
+import { Type } from "arktype";
+import * as zodModule from "zod/v4";
 import { type ExtensionModule, extensionModuleCapability } from "../../capability/extension-module";
 import { type Hook, hookCapability } from "../../capability/hook";
 import { loadCapability } from "../../discovery";
@@ -23,7 +24,7 @@ import { installLegacyPiSpecifierShim, loadLegacyPiModule } from "../plugins/leg
 import { getAllPluginExtensionPaths } from "../plugins/loader";
 import * as TypeBox from "../typebox";
 
-import { resolvePath } from "../utils";
+import { resolvePath, withExitGuard } from "../utils";
 import type {
 	AssistantThinkingRenderer,
 	Extension,
@@ -123,7 +124,8 @@ export class ExtensionRuntime implements IExtensionRuntime {
 class ConcreteExtensionAPI implements ExtensionAPI, IExtensionRuntime {
 	readonly logger = logger;
 	readonly typebox = TypeBox;
-	readonly zod = z;
+	readonly arktype = Type;
+	readonly zod = zodModule;
 	readonly flagValues = new Map<string, boolean | string>();
 	readonly pendingProviderRegistrations: Array<{
 		name: string;
@@ -288,7 +290,7 @@ async function loadExtension(
 ): Promise<{ extension: Extension | null; error: string | null }> {
 	const resolvedPath = resolvePath(extensionPath, cwd);
 	try {
-		const module = (await loadLegacyPiModule(resolvedPath)) as LoadedExtensionModule;
+		const module = (await withExitGuard(() => loadLegacyPiModule(resolvedPath))) as LoadedExtensionModule;
 		const factory = getExtensionFactory(module);
 
 		if (typeof factory !== "function") {
@@ -300,7 +302,9 @@ async function loadExtension(
 
 		const extension = createExtension(extensionPath, resolvedPath);
 		const api = new ConcreteExtensionAPI(PiCodingAgent, extension, runtime, cwd, eventBus);
-		await factory(api);
+		await withExitGuard(async () => {
+			await factory(api);
+		});
 
 		return { extension, error: null };
 	} catch (err) {

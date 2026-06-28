@@ -4,8 +4,15 @@ import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import type { OAuthProvider } from "@oh-my-pi/pi-ai/oauth/types";
 import type { Component, OverlayHandle } from "@oh-my-pi/pi-tui";
 import { Input, Loader, Spacer, setTuiTight, Text } from "@oh-my-pi/pi-tui";
-import { getAgentDbPath, getProjectDir, normalizePathForComparison } from "@oh-my-pi/pi-utils";
-import { formatModelSelectorValue } from "../../config/model-resolver";
+import { getAgentDbPath, getAgentDir, getProjectDir, normalizePathForComparison } from "@oh-my-pi/pi-utils";
+import {
+	type AdvisorConfigScope,
+	discoverAdvisorConfigs,
+	loadWatchdogConfigFile,
+	resolveAdvisorConfigEditPath,
+	saveWatchdogConfigFile,
+} from "../../advisor";
+import { formatModelSelectorValue, resolveAdvisorRoleSelection } from "../../config/model-resolver";
 import { getRoleInfo } from "../../config/model-roles";
 import { settings } from "../../config/settings";
 import { disableProvider, enableProvider } from "../../discovery";
@@ -22,12 +29,13 @@ import {
 	getSymbolTheme,
 	previewTheme,
 	setColorBlindMode,
+	setMarkdownMermaidRendering,
 	setSymbolPreset,
 	setTheme,
 	theme,
 } from "../../modes/theme/theme";
 import type { InteractiveModeContext } from "../../modes/types";
-import type { ResetCreditRedeemOutcome } from "../../session/auth-storage";
+import type { ResetCreditAccountStatus, ResetCreditRedeemOutcome } from "../../session/auth-storage";
 import type { SessionInfo } from "../../session/session-listing";
 import { SessionManager } from "../../session/session-manager";
 import { FileSessionStorage } from "../../session/session-storage";
@@ -48,7 +56,9 @@ import {
 } from "../../tools";
 import { shortenPath } from "../../tools/render-utils";
 import { copyToClipboard } from "../../utils/clipboard";
+import { repo } from "../../utils/git";
 import { setSessionTerminalTitle } from "../../utils/title-generator";
+import { type AdvisorConfigDeps, AdvisorConfigOverlayComponent } from "../components/advisor-config";
 import { AgentDashboard } from "../components/agent-dashboard";
 import { AgentHubOverlayComponent } from "../components/agent-hub";
 import { AssistantMessageComponent } from "../components/assistant-message";
@@ -84,6 +94,22 @@ export class SelectorController {
 			),
 		);
 	}
+
+	/**
+	 * Restore keyboard focus to whatever currently owns the editor slot. The
+	 * slot can hold the editor itself or a hook selector/input/editor pushed
+	 * in by `ExtensionUiController` — e.g. an approval prompt that fired while
+	 * a fullscreen overlay was up. `overlayHandle.hide()` restores focus to
+	 * the component focused when the overlay opened, which is stale in that
+	 * case (the editor was swapped out): keys land on a hidden editor and the
+	 * visible prompt receives nothing (issue #3349). Call this after the
+	 * overlay hides to re-target focus at the visible slot owner.
+	 */
+	focusActiveEditorArea(): void {
+		const visible = this.ctx.editorContainer.children[0] ?? this.ctx.editor;
+		this.ctx.ui.setFocus(visible);
+	}
+
 	/**
 	 * Shows a selector component in place of the editor.
 	 * @param create Factory that receives a `done` callback and returns the component and focus target
@@ -109,7 +135,7 @@ export class SelectorController {
 			let overlayHandle: OverlayHandle | undefined;
 			const done = () => {
 				overlayHandle?.hide();
-				this.ctx.ui.setFocus(this.ctx.editor);
+				this.focusActiveEditorArea();
 				this.ctx.ui.requestRender();
 			};
 			const selector = new SettingsSelectorComponent(
@@ -117,6 +143,9 @@ export class SelectorController {
 					availableThinkingLevels: [...this.ctx.session.getAvailableThinkingLevels()],
 					thinkingLevel: this.ctx.session.thinkingLevel,
 					availableThemes,
+					providers: [...new Set(this.ctx.session.getAvailableModels().map(model => model.provider))].sort(
+						(a, b) => a.localeCompare(b),
+					),
 					cwd: getProjectDir(),
 					model: this.ctx.session.model,
 					imageBudget: this.ctx.ui.imageBudget,
@@ -143,6 +172,7 @@ export class SelectorController {
 							showHookStatus: settings.get("statusLine.showHookStatus"),
 							sessionAccent: settings.get("statusLine.sessionAccent"),
 							transparent: settings.get("statusLine.transparent"),
+							compactThinkingLevel: settings.get("statusLine.compactThinkingLevel"),
 							...previewSettings,
 						});
 						this.ctx.updateEditorTopBorder();
@@ -171,6 +201,7 @@ export class SelectorController {
 							showHookStatus: settings.get("statusLine.showHookStatus"),
 							sessionAccent: settings.get("statusLine.sessionAccent"),
 							transparent: settings.get("statusLine.transparent"),
+							compactThinkingLevel: settings.get("statusLine.compactThinkingLevel"),
 						});
 						this.ctx.updateEditorTopBorder();
 						this.ctx.ui.requestRender();
@@ -187,6 +218,78 @@ export class SelectorController {
 			this.ctx.ui.setFocus(selector);
 			this.ctx.ui.requestRender();
 		});
+	}
+
+	showAdvisorConfigure(): void {
+		const cwd = this.ctx.sessionManager.getCwd();
+		const agentDir = getAgentDir() ?? getProjectDir();
+		const initialScope: AdvisorConfigScope = "project";
+		void (async () => {
+			// "Project" scope edits the repo-root WATCHDOG.yml (the project-level file
+			// discovery walks), not the launch subdir — `getProjectDir()` is only cwd.
+			let projectDir = cwd;
+			try {
+				projectDir = (await repo.root(cwd)) ?? cwd;
+			} catch {
+				projectDir = cwd;
+			}
+			const dirs = { projectDir, agentDir };
+			const initialDoc = await loadWatchdogConfigFile(await resolveAdvisorConfigEditPath(initialScope, dirs));
+			// Fullscreen editor on the alternate screen (the /settings idiom): the
+			// overlay holds the alt buffer + mouse tracking; the transcript stays put.
+			let overlayHandle: OverlayHandle | undefined;
+			const done = () => {
+				overlayHandle?.hide();
+				this.focusActiveEditorArea();
+				this.ctx.ui.requestRender();
+			};
+			// Label the seeded implicit-default row with the actual advisor-role model
+			// (NOT the first live advisor, which may be a named advisor from another scope).
+			const advisorRoleSel = resolveAdvisorRoleSelection(
+				this.ctx.settings,
+				this.ctx.session.modelRegistry.getAvailable(),
+				this.ctx.session.modelRegistry,
+			);
+			const defaultAdvisorModel = advisorRoleSel?.model;
+			const deps: AdvisorConfigDeps = {
+				modelRegistry: this.ctx.session.modelRegistry,
+				settings: this.ctx.settings,
+				scopedModels: this.ctx.session.scopedModels,
+				availableToolNames: this.ctx.session.getAdvisorAvailableToolNames(),
+				defaultModelLabel: defaultAdvisorModel
+					? `${defaultAdvisorModel.provider}/${defaultAdvisorModel.id}`
+					: undefined,
+			};
+			const overlay = new AdvisorConfigOverlayComponent(this.ctx.ui, deps, initialScope, initialDoc, {
+				loadDoc: async scope => loadWatchdogConfigFile(await resolveAdvisorConfigEditPath(scope, dirs)),
+				save: async (scope, doc) => {
+					await saveWatchdogConfigFile(await resolveAdvisorConfigEditPath(scope, dirs), doc);
+					// Re-discover the merged roster (project + user) so the live advisors
+					// reflect cross-level precedence, not just the edited file.
+					const discovered = await discoverAdvisorConfigs(cwd, agentDir);
+					const count = this.ctx.session.applyAdvisorConfigs(discovered.advisors, discovered.sharedInstructions);
+					this.ctx.statusLine.invalidate();
+					this.ctx.showStatus(
+						count > 0
+							? `Saved ${scope} WATCHDOG.yml — ${count} advisor${count === 1 ? "" : "s"} active.`
+							: `Saved ${scope} WATCHDOG.yml. Run /advisor on to activate the configured advisors.`,
+					);
+					this.ctx.ui.requestRender();
+				},
+				close: done,
+				requestRender: () => this.ctx.ui.requestRender(),
+				notify: message => this.ctx.showStatus(message),
+			});
+			overlayHandle = this.ctx.ui.showOverlay(overlay, {
+				anchor: "bottom-center",
+				width: "100%",
+				maxHeight: "100%",
+				margin: 0,
+				fullscreen: true,
+			});
+			this.ctx.ui.setFocus(overlay);
+			this.ctx.ui.requestRender();
+		})();
 	}
 
 	showHistorySearch(): void {
@@ -216,14 +319,19 @@ export class SelectorController {
 	 */
 	async showExtensionsDashboard(): Promise<void> {
 		const dashboard = await ExtensionDashboard.create(getProjectDir(), this.ctx.settings, this.ctx.ui.terminal.rows);
+		// Fullscreen dashboard on the alternate screen (the /settings idiom): the
+		// overlay borrows the terminal's alt buffer and enables mouse tracking for
+		// its lifetime, leaving the transcript untouched underneath.
 		const overlay = this.ctx.ui.showOverlay(dashboard, {
 			width: "100%",
 			maxHeight: "100%",
 			anchor: "top-left",
 			margin: 0,
+			fullscreen: true,
 		});
 		dashboard.onClose = () => {
 			overlay.hide();
+			this.focusActiveEditorArea();
 			this.ctx.ui.requestRender();
 		};
 		dashboard.onRequestRender = () => {
@@ -251,6 +359,7 @@ export class SelectorController {
 		});
 		dashboard.onClose = () => {
 			overlay.hide();
+			this.focusActiveEditorArea();
 			this.ctx.ui.requestRender();
 		};
 		dashboard.onRequestRender = () => {
@@ -314,21 +423,51 @@ export class SelectorController {
 					}
 				}
 				break;
-			case "hideThinking":
+			case "hideThinkingBlock":
 				this.ctx.hideThinkingBlock = value as boolean;
-				this.ctx.session.agent.hideThinkingSummary = value as boolean;
 				for (const child of this.ctx.chatContainer.children) {
 					if (child instanceof AssistantMessageComponent) {
-						child.setHideThinkingBlock(value as boolean);
-						child.invalidate();
+						child.setHideThinkingBlock(this.ctx.effectiveHideThinkingBlock);
 					}
 				}
+				// Full clear + replay so blocks frozen in committed scrollback on
+				// ED3-risk terminals retire their stale snapshots too (see
+				// InputController.toggleThinkingBlockVisibility).
+				this.ctx.ui.resetDisplay();
+				break;
+			case "proseOnlyThinking":
+				this.ctx.proseOnlyThinking = value as boolean;
+				for (const child of this.ctx.chatContainer.children) {
+					if (child instanceof AssistantMessageComponent) {
+						child.setProseOnlyThinking(value as boolean);
+					}
+				}
+				this.ctx.ui.resetDisplay();
+				break;
+			case "omitThinking":
+				this.ctx.session.agent.hideThinkingSummary = value as boolean;
+				break;
+			case "display.cacheMissMarker":
+				// Rebuild re-runs the usage-based detection under the new setting so
+				// markers appear/disappear; full reset retires any already committed
+				// to native scrollback (mirrors hideThinking).
+				this.ctx.rebuildChatFromMessages();
+				this.ctx.ui.resetDisplay();
 				break;
 			case "tui.tight":
 				setTuiTight(value as boolean);
 				this.ctx.ui.invalidate();
 				this.ctx.updateEditorTopBorder();
 				this.ctx.ui.requestRender();
+				break;
+
+			case "tui.renderMermaid":
+				setMarkdownMermaidRendering(value as boolean);
+				this.ctx.session.refreshBaseSystemPrompt().catch(err => {
+					this.ctx.showError(`Failed to apply Mermaid rendering setting: ${err}`);
+				});
+				this.ctx.rebuildChatFromMessages();
+				this.ctx.ui.resetDisplay();
 				break;
 
 			case "theme": {
@@ -395,6 +534,7 @@ export class SelectorController {
 			case "statusLine.showHookStatus":
 			case "statusLine.sessionAccent":
 			case "statusLine.transparent":
+			case "statusLine.compactThinkingLevel":
 			case "statusLineSegments":
 			case "statusLineModelThinking":
 			case "statusLinePathAbbreviate":
@@ -415,6 +555,7 @@ export class SelectorController {
 					sessionAccent: settings.get("statusLine.sessionAccent"),
 					transparent: settings.get("statusLine.transparent"),
 					segmentOptions: settings.get("statusLine.segmentOptions"),
+					compactThinkingLevel: settings.get("statusLine.compactThinkingLevel"),
 				};
 				this.ctx.statusLine.updateSettings(statusLineSettings);
 				this.ctx.updateEditorTopBorder();
@@ -473,23 +614,32 @@ export class SelectorController {
 							}
 							this.ctx.statusLine.invalidate();
 							this.ctx.updateEditorBorderColor();
-							this.ctx.showStatus(`Temporary model: ${selector ?? model.id}`);
+							const roleSelectorHint = this.ctx.keybindings.getKeys("app.model.select")[0] ?? "Alt+M";
+							this.ctx.showStatus(
+								`Session-only model: ${selector ?? model.id}. Use ${roleSelectorHint} or /model for roles.`,
+							);
 							done();
 							this.ctx.ui.requestRender();
 						} else if (role === "default") {
-							// Default: update agent state and persist
-							await this.ctx.session.setModel(model, role, {
+							const { switched } = await this.ctx.session.setModel(model, role, {
 								selector,
 								thinkingLevel: concreteThinking,
 								persist: true,
+								currentContextTokens,
 							});
 							if (isAuto) {
-								this.ctx.session.setThinkingLevel(AUTO_THINKING, true);
-							} else if (concreteThinking && concreteThinking !== ThinkingLevel.Inherit) {
+								if (switched) {
+									this.ctx.session.setThinkingLevel(AUTO_THINKING, true);
+								} else {
+									this.ctx.settings.set("defaultThinkingLevel", AUTO_THINKING);
+								}
+							} else if (switched && concreteThinking && concreteThinking !== ThinkingLevel.Inherit) {
 								this.ctx.session.setThinkingLevel(concreteThinking);
 							}
-							this.ctx.statusLine.invalidate();
-							this.ctx.updateEditorBorderColor();
+							if (switched) {
+								this.ctx.statusLine.invalidate();
+								this.ctx.updateEditorBorderColor();
+							}
 							this.ctx.showStatus(`Default model: ${selector ?? model.id}`);
 							// Don't call done() - selector stays open for role assignment
 						} else {
@@ -807,14 +957,9 @@ export class SelectorController {
 			this.ctx.sessionManager.getCwd(),
 			this.ctx.sessionManager.getSessionDir(),
 		);
-		// Current folder has no sessions: preload the global list so the picker
-		// can open straight into all-projects scope instead of dead-ending.
-		let allSessions: SessionInfo[] | undefined;
-		let startInAllScope = false;
-		if (sessions.length === 0) {
-			allSessions = await SessionManager.listAll();
-			startInAllScope = allSessions.length > 0;
-		}
+		// Always open in current-folder scope; the empty-state hint in SessionList
+		// invites the user to Tab into all-projects rather than silently surfacing
+		// every project's history when the cwd has nothing to resume. See #3099.
 		const historyStorage = this.ctx.historyStorage;
 		const historyMatcher = historyStorage ? (query: string) => historyStorage.matchingSessionIds(query) : undefined;
 		this.showSelector(done => {
@@ -848,8 +993,6 @@ export class SelectorController {
 					},
 					historyMatcher,
 					loadAllSessions: () => SessionManager.listAll(),
-					allSessions,
-					startInAllScope,
 					getTerminalRows: () => this.ctx.ui.terminal.rows,
 				},
 			);
@@ -881,7 +1024,7 @@ export class SelectorController {
 
 		this.ctx.clearTransientSessionUi();
 		this.ctx.statusLine.invalidate();
-		this.ctx.statusLine.setSessionStartTime(Date.now());
+		this.ctx.statusLine.resetActiveTime();
 		this.ctx.updateEditorTopBorder();
 		this.ctx.updateEditorBorderColor();
 		this.ctx.renderInitialMessages({ clearTerminalHistory: true });
@@ -1151,7 +1294,7 @@ export class SelectorController {
 	async showResetUsageSelector(): Promise<void> {
 		const session = this.ctx.session;
 		this.ctx.showStatus("Checking saved rate-limit resets…", { dim: true });
-		let statuses: Awaited<ReturnType<typeof session.listResetCredits>>;
+		let statuses: ResetCreditAccountStatus[];
 		try {
 			statuses = await session.listResetCredits();
 		} catch (error) {
@@ -1253,7 +1396,8 @@ export class SelectorController {
 			getTool: name => this.ctx.session.getToolByName(name),
 			getMessageRenderer: type => this.ctx.session.extensionRunner?.getMessageRenderer(type),
 			cwd: this.ctx.sessionManager.getCwd(),
-			hideThinkingBlock: () => this.ctx.hideThinkingBlock,
+			hideThinkingBlock: () => this.ctx.effectiveHideThinkingBlock,
+			proseOnlyThinking: () => this.ctx.proseOnlyThinking,
 			focusAgent: id => this.ctx.focusAgentSession(id),
 			sessionFile: this.ctx.sessionManager.getSessionFile() ?? null,
 		});

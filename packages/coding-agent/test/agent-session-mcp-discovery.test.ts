@@ -16,7 +16,8 @@ import type { CustomTool } from "@oh-my-pi/pi-coding-agent/extensibility/custom-
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { OutputMeta } from "@oh-my-pi/pi-coding-agent/tools/output-meta";
-import { z } from "zod/v4";
+import { removeSyncWithRetries } from "@oh-my-pi/pi-utils";
+import { type } from "arktype";
 
 function createModel(): Model<"openai-responses"> {
 	return buildModel({
@@ -34,7 +35,7 @@ function createModel(): Model<"openai-responses"> {
 }
 
 function createBasicTool(name: string, label: string): AgentTool {
-	const schema = z.object({ value: z.string() });
+	const schema = type({ value: "string" });
 	return {
 		name,
 		label,
@@ -54,12 +55,15 @@ function createMcpTool(
 	description: string,
 	schemaKeys: string[],
 ): AgentTool {
-	const properties = Object.fromEntries(schemaKeys.map(key => [key, z.string()]));
+	const properties: Record<string, unknown> = {};
+	for (const key of schemaKeys) {
+		properties[key] = "string";
+	}
 	return {
 		name,
 		label: `${serverName}/${mcpToolName}`,
 		description,
-		parameters: z.object(properties),
+		parameters: type(properties),
 		strict: true,
 		mcpServerName: serverName,
 		mcpToolName,
@@ -76,12 +80,15 @@ function createMcpCustomTool(
 	description: string,
 	schemaKeys: string[],
 ): CustomTool {
-	const properties = Object.fromEntries(schemaKeys.map(key => [key, z.string()]));
+	const properties: Record<string, unknown> = {};
+	for (const key of schemaKeys) {
+		properties[key] = "string";
+	}
 	return {
 		name,
 		label: `${serverName}/${mcpToolName}`,
 		description,
-		parameters: z.object(properties),
+		parameters: type(properties),
 		mcpServerName: serverName,
 		mcpToolName,
 		async execute() {
@@ -96,7 +103,7 @@ function createOversizedMcpTool(name: string, serverName: string, mcpToolName: s
 		name,
 		label: `${serverName}/${mcpToolName}`,
 		description: `${mcpToolName} dump`,
-		parameters: z.object({}),
+		parameters: type("object"),
 		mcpServerName: serverName,
 		mcpToolName,
 		async execute() {
@@ -143,7 +150,7 @@ describe("AgentSession MCP discovery", () => {
 			await session.dispose();
 		}
 		for (const tempDir of tempDirs.splice(0)) {
-			fs.rmSync(tempDir, { recursive: true, force: true });
+			removeSyncWithRetries(tempDir);
 		}
 	});
 

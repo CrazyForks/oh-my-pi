@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -199,19 +201,48 @@ class GitHubClient:
             return None
         return resp.json()
 
+    _TRANSIENT_RETRY_DELAYS = (1.0, 3.0, 10.0)
+    """Backoff schedule for transient connection/timeout errors."""
+
     def request_sync(
         self, method: str, path: str, *, json: Mapping[str, Any] | None = None, params: Mapping[str, Any] | None = None
     ) -> Any:
-        with self._client() as client:
-            resp = client.request(method, path, json=json, params=params)
-            return self._check(resp)
+        last_exc: Exception | None = None
+        for attempt, delay in enumerate((*self._TRANSIENT_RETRY_DELAYS, None)):
+            try:
+                with self._client() as client:
+                    resp = client.request(method, path, json=json, params=params)
+                    return self._check(resp)
+            except (httpx.ConnectError, httpx.TimeoutException) as exc:
+                last_exc = exc
+                if delay is None:
+                    break
+                log.warning(
+                    "transient error, retrying",
+                    extra={"method": method, "path": path, "attempt": attempt + 1, "delay": delay, "error": str(exc)},
+                )
+                time.sleep(delay)
+        raise last_exc  # type: ignore[misc]
 
     async def request(
         self, method: str, path: str, *, json: Mapping[str, Any] | None = None, params: Mapping[str, Any] | None = None
     ) -> Any:
-        async with self._async_client() as client:
-            resp = await client.request(method, path, json=json, params=params)
-            return self._check(resp)
+        last_exc: Exception | None = None
+        for attempt, delay in enumerate((*self._TRANSIENT_RETRY_DELAYS, None)):
+            try:
+                async with self._async_client() as client:
+                    resp = await client.request(method, path, json=json, params=params)
+                    return self._check(resp)
+            except (httpx.ConnectError, httpx.TimeoutException) as exc:
+                last_exc = exc
+                if delay is None:
+                    break
+                log.warning(
+                    "transient error, retrying",
+                    extra={"method": method, "path": path, "attempt": attempt + 1, "delay": delay, "error": str(exc)},
+                )
+                await asyncio.sleep(delay)
+        raise last_exc  # type: ignore[misc]
 
     # ---- repos / issues / comments / PRs ----
     async def get_repo(self, repo: str) -> RepoInfo:
@@ -445,6 +476,16 @@ class GitHubClient:
             json={"labels": labels},
         )
         return tuple(str(lbl["name"]) if isinstance(lbl, dict) else str(lbl) for lbl in (data or []))
+
+    async def remove_issue_label(self, repo: str, number: int, label: str) -> None:
+        """Remove one label from an issue (or PR)."""
+        if not label:
+            return
+        encoded = quote(label, safe="")
+        await self.request(
+            "DELETE",
+            f"/repos/{repo}/issues/{number}/labels/{encoded}",
+        )
 
     async def submit_pr_review(
         self,

@@ -529,12 +529,21 @@ async function collectThreads(session: AgentSession, currentThreadId?: string): 
 		let id = name.slice(0, -6);
 		try {
 			const fileText = await Bun.file(fullPath).text();
-			const firstLine = fileText.split("\n", 1)[0] ?? "";
-			const parsed = parseJsonlLenient(firstLine);
-			const header = Array.isArray(parsed) && parsed.length > 0 ? (parsed[0] as Record<string, unknown>) : undefined;
-			if (header && header.type === "session") {
-				if (typeof header.cwd === "string") cwd = header.cwd;
-				if (typeof header.id === "string") id = header.id;
+			let sawTitleSlot = false;
+			for (const rawLine of fileText.split(/\r?\n/)) {
+				const line = rawLine.trim();
+				if (!line) continue;
+				const parsed = parseJsonlLenient<Record<string, unknown>>(line);
+				const header = Array.isArray(parsed) && parsed.length > 0 ? parsed[0] : undefined;
+				if (!sawTitleSlot && header?.type === "title") {
+					sawTitleSlot = true;
+					continue;
+				}
+				if (header?.type === "session") {
+					if (typeof header.cwd === "string") cwd = header.cwd;
+					if (typeof header.id === "string") id = header.id;
+				}
+				break;
 			}
 		} catch {
 			// ignore malformed session files
@@ -559,7 +568,7 @@ function shouldPersistResponseItemForMemories(message: AgentMessage): boolean {
 	}
 	if (role !== "toolResult") return false;
 	const toolName = (message as { toolName?: string }).toolName;
-	if (toolName === "bash" || toolName === "eval" || toolName === "read" || toolName === "search") {
+	if (toolName === "bash" || toolName === "eval" || toolName === "read" || toolName === "grep") {
 		const text = extractMessageText(message);
 		return text.length > 0 && text.length <= 32_000;
 	}

@@ -485,6 +485,17 @@ def test_trigger_triage_replaces_inactive_manual_delivery(env, monkeypatch: pyte
     with TestClient(app) as client:
         db = get_database(cfg.sqlite_path)
         db.record_event(
+            delivery_id="running-octo__widget-7",
+            event_type="issue_comment",
+            repo="octo/widget",
+            issue_key=issue_key("octo/widget", 7),
+            payload={"action": "created"},
+        )
+        claimed = db.claim_next_event()
+        assert claimed is not None
+        assert claimed.delivery_id == "running-octo__widget-7"
+
+        db.record_event(
             delivery_id=delivery,
             event_type="issues",
             repo="octo/widget",
@@ -633,6 +644,17 @@ def test_trigger_retry_by_delivery_id_requeues(env, monkeypatch: pytest.MonkeyPa
     with TestClient(app) as client:
         db = get_database(cfg.sqlite_path)
         db.record_event(
+            delivery_id="running-widget-4",
+            event_type="issue_comment",
+            repo="octo/widget",
+            issue_key=issue_key("octo/widget", 4),
+            payload={"action": "created"},
+        )
+        claimed = db.claim_next_event()
+        assert claimed is not None
+        assert claimed.delivery_id == "running-widget-4"
+
+        db.record_event(
             delivery_id="d-old",
             event_type="issues",
             repo="octo/widget",
@@ -658,6 +680,17 @@ def test_trigger_retry_by_issue_finds_latest_non_skipped_event(env, monkeypatch:
     with TestClient(app) as client:
         db = get_database(cfg.sqlite_path)
         key = issue_key("octo/widget", 9)
+        db.record_event(
+            delivery_id="running-widget-9",
+            event_type="issue_comment",
+            repo="octo/widget",
+            issue_key=key,
+            payload={"action": "created"},
+        )
+        claimed = db.claim_next_event()
+        assert claimed is not None
+        assert claimed.delivery_id == "running-widget-9"
+
         db.record_event(
             delivery_id="d-old-1",
             event_type="issues",
@@ -1503,6 +1536,43 @@ def test_webhook_directive_on_unknown_issue_is_queued_with_metadata(env) -> None
     assert directive == {"body": "please refactor X", "author": "can1357", "pragmas": [], "authorizes_impl": True}
 
 
+def test_webhook_directive_authorizes_deployed_app_login_without_author_association(
+    monkeypatch: pytest.MonkeyPatch, env
+) -> None:
+    monkeypatch.setenv("ROBOMP_BOT_LOGIN", "@roboomp[bot]")
+    monkeypatch.setenv("ROBOMP_REPO_ALLOWLIST", "can1357/widget")
+    reset_settings_cache()
+    cfg = Settings()  # type: ignore[call-arg]
+    cfg.ensure_paths()
+    app = create_app(cfg)
+    payload = {
+        "action": "created",
+        "comment": {
+            "user": {"login": "can1357"},
+            "body": "@roboomp go ahead",
+        },
+        "issue": {"number": 3196},
+        "repository": {
+            "full_name": "can1357/widget",
+            "owner": {"login": "can1357", "type": "User"},
+        },
+    }
+    raw = json.dumps(payload).encode()
+    with TestClient(app) as client:
+        resp = client.post(
+            "/webhook/github",
+            content=raw,
+            headers=_signed_headers("test-webhook-secret", raw, event="issue_comment", delivery="dir-app-login"),
+        )
+        assert resp.status_code == 202
+        assert resp.json()["state"] == "queued"
+        row = get_database(cfg.sqlite_path).get_event("dir-app-login")
+    close_database()
+    assert row is not None
+    directive = row.payload.get("_robomp_directive")
+    assert directive == {"body": "go ahead", "author": "can1357", "pragmas": [], "authorizes_impl": True}
+
+
 def test_webhook_maintainer_bypasses_rate_limit(
     rate_limited_settings: Settings,
     monkeypatch: pytest.MonkeyPatch,
@@ -1528,8 +1598,16 @@ def test_webhook_maintainer_bypasses_rate_limit(
             )
             assert resp.status_code == 202
             states.append(resp.json()["state"])
+        directive_event = get_database(cfg.sqlite_path).get_event("m-3")
     close_database()
     assert states == ["queued"] * 4, states
+    assert directive_event is not None
+    assert directive_event.payload.get("_robomp_directive") == {
+        "body": "do X",
+        "author": "can1357",
+        "pragmas": [],
+        "authorizes_impl": True,
+    }
 
 
 # -------- handler-level: bootstrap + reopen ----------------------------
@@ -2208,6 +2286,87 @@ async def test_handle_comment_finalized_without_directive_still_replies(
     assert stub_run_task == [], "must not invoke run_task on plain finalized comment"
     assert post_comment_calls, "should post the finalized-issue reply"
     assert sandbox.remove_calls == []
+    close_database()
+
+
+async def test_handle_comment_resumes_needs_info_without_preemptive_cleanup(
+    settings: Settings, tmp_path: Path, stub_run_task, monkeypatch
+) -> None:
+    """A needs-info reply resumes first; host tools clear state only after actionable work."""
+    from robomp import tasks
+    from robomp.github_client import GitHubClient, IssueInfo, RepoInfo
+
+    sandbox = _RecordingSandbox(tmp_path)
+    db = get_database(settings.sqlite_path)
+    db.upsert_issue(
+        key="octo/widget#88",
+        repo="octo/widget",
+        number=88,
+        state="needs_info",
+        branch="farm/old/branch",
+    )
+
+    repo = RepoInfo(
+        full_name="octo/widget", default_branch="main", clone_url="https://github.com/octo/widget.git", private=False
+    )
+    issue = IssueInfo(
+        repo="octo/widget",
+        number=88,
+        title="boom",
+        body="details",
+        state="open",
+        author="alice",
+        labels=("needs-info",),
+        is_pull_request=False,
+    )
+
+    async def _resolve(_gh, _payload):
+        return repo, issue
+
+    monkeypatch.setattr(tasks, "_resolve_repo_and_issue", _resolve)
+
+    post_comment_calls: list = []
+    removed_labels: list[tuple[str, int, str]] = []
+
+    async def _capture_post(self, *args, **kwargs):
+        post_comment_calls.append((args, kwargs))
+        return None
+
+    async def _capture_remove_label(self, repo: str, number: int, label: str) -> None:
+        removed_labels.append((repo, number, label))
+
+    monkeypatch.setattr(GitHubClient, "post_comment", _capture_post)
+    monkeypatch.setattr(GitHubClient, "remove_issue_label", _capture_remove_label)
+
+    payload = {
+        "action": "created",
+        "issue": {"number": 88, "user": {"login": "alice"}, "title": "boom"},
+        "comment": {
+            "user": {"login": "alice"},
+            "body": "I am on Bun 1.3.14 and here is the trace",
+            "id": 4,
+            "created_at": "2026-05-14T23:00:00Z",
+        },
+        "repository": {"full_name": "octo/widget"},
+    }
+    await tasks.handle_comment(
+        settings=settings,
+        db=db,
+        github=GitHubClient("t"),
+        git_transport=LocalGitTransport(token=None),
+        sandbox=sandbox,
+        payload=payload,
+        delivery_id="test-delivery-needs-info",
+    )
+    assert len(stub_run_task) == 1
+    call = stub_run_task[0]
+    assert call["task_kind"] == "handle_comment"
+    assert call["comment"].body == "I am on Bun 1.3.14 and here is the trace"
+    assert sandbox.ensure_calls[0]["existing_branch"] == "farm/old/branch"
+    assert removed_labels == []
+    assert post_comment_calls == [], "needs-info replies must not get the finalized-issue notice"
+    row = db.get_issue("octo/widget#88")
+    assert row is not None and row.state == "needs_info"
     close_database()
 
 

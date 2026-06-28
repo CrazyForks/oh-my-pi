@@ -23,6 +23,7 @@ IssueState = Literal[
     "opened",
     "merged",
     "closed",
+    "needs_info",
     "abandoned",
 ]
 
@@ -605,6 +606,26 @@ class Database:
             attempts=int(row["attempts"]),
             last_error=row["last_error"],
         )
+
+    def has_authorized_impl_event(self, issue_key: str) -> bool:
+        """Return whether a non-skipped event on this issue carried implementation authorization."""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT payload_json
+                FROM events
+                WHERE issue_key = ?
+                  AND state <> 'skipped'
+                ORDER BY received_at DESC
+                """,
+                (issue_key,),
+            ).fetchall()
+        for row in rows:
+            payload = json.loads(row["payload_json"])
+            directive = payload.get("_robomp_directive")
+            if isinstance(directive, dict) and directive.get("authorizes_impl") is True:
+                return True
+        return False
 
     def requeue_event(
         self,

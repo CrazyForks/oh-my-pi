@@ -2,7 +2,7 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 import type { ToolExample } from "@oh-my-pi/pi-ai";
 import type { Component } from "@oh-my-pi/pi-tui";
 import { prompt } from "@oh-my-pi/pi-utils";
-import { z } from "zod/v4";
+import { type } from "arktype";
 import type { SSHHost } from "../capability/ssh";
 import { sshCapability } from "../capability/ssh";
 import { loadCapability } from "../discovery";
@@ -23,11 +23,11 @@ import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout } from "./tool-timeouts";
 
-const sshSchema = z.object({
-	host: z.string().describe("ssh host"),
-	command: z.string().describe("remote command"),
-	cwd: z.string().optional().describe("remote working directory"),
-	timeout: z.number().optional().describe("timeout in seconds").default(60),
+const sshSchema = type({
+	host: type("string").describe("ssh host"),
+	command: type("string").describe("remote command"),
+	"cwd?": type("string").describe("remote working directory"),
+	"timeout?": type("number").describe("timeout in seconds"),
 });
 
 export interface SSHToolDetails {
@@ -118,7 +118,7 @@ async function loadHosts(session: ToolSession): Promise<{
 	return { hostNames, hostsByName };
 }
 
-type SshToolParams = z.infer<typeof sshSchema>;
+type SshToolParams = typeof sshSchema.infer;
 
 export class SshTool implements AgentTool<typeof sshSchema, SSHToolDetails> {
 	readonly name = "ssh";
@@ -136,7 +136,7 @@ export class SshTool implements AgentTool<typeof sshSchema, SSHToolDetails> {
 	readonly concurrency = "exclusive";
 	readonly strict = true;
 
-	readonly examples: readonly ToolExample<z.input<typeof sshSchema>>[] = [
+	readonly examples: readonly ToolExample<SshToolParams>[] = [
 		{
 			caption: "List files: Linux (on server1 (10.0.0.1) | linux/bash)",
 			call: { host: "server1", command: "ls -la /home/user" },
@@ -281,6 +281,7 @@ export const sshToolRenderer = {
 		result: {
 			content: Array<{ type: string; text?: string }>;
 			details?: SSHToolDetails;
+			isError?: boolean;
 		},
 		options: RenderResultOptions & { renderContext?: SshRenderContext },
 		uiTheme: Theme,
@@ -289,8 +290,14 @@ export const sshToolRenderer = {
 		const details = result.details;
 		const host = args?.host || "…";
 		const command = args?.command ?? "";
+		const isError = result.isError === true;
+		const isPartial = options.isPartial === true;
 		const header = renderStatusLine(
-			{ iconOverride: uiTheme.styledSymbol("tool.ssh", "accent"), title: "SSH", description: `[${host}]` },
+			isPartial
+				? { icon: "pending", title: "SSH", description: `[${host}]` }
+				: isError
+					? { icon: "error", title: "SSH", description: `[${host}]` }
+					: { iconOverride: uiTheme.styledSymbol("tool.ssh", "accent"), title: "SSH", description: `[${host}]` },
 			uiTheme,
 		);
 		const cmdLines = formatSshCommandLines(command, uiTheme);
@@ -342,7 +349,7 @@ export const sshToolRenderer = {
 				return outputBlock.render(
 					{
 						header,
-						state: "success",
+						state: isPartial ? "pending" : isError ? "error" : "success",
 						sections: [
 							{
 								// Viewport-sized tail window in every state — streaming and final
@@ -362,8 +369,20 @@ export const sshToolRenderer = {
 		});
 	},
 	mergeCallAndResult: true,
-	// Collapsed pending preview caps the command to a viewport-sized tail window
-	// that shifts while args stream. Expanded output is top-anchored enough for
-	// the transcript to commit its settled prefix.
-	provisionalPendingPreview: "collapsed",
+	// Pending call preview can re-anchor wholesale when the final result inserts
+	// the `Output` section, so no pending SSH rows may commit to native
+	// scrollback — even when expanded. The expanded pending shape was previously
+	// allowed to commit, which left two visible shapes in native scrollback once
+	// the result settled: a stale `⏳ SSH: [host]` header above the final frame,
+	// and the pending `╰──╯` footer reused in-place as the new `├── Output ──┤`
+	// separator with a fresh footer pushed below it.
+	provisionalPendingPreview: true,
+	// Partial-result chrome (pending icon and frame state) differs from the
+	// final SSH glyph/state, so the block stays commit-unstable while
+	// `options.isPartial` holds. Without this, a long-running SSH command's
+	// stable pending header would be promoted by the stable-prefix ratchet and
+	// committed to native scrollback, then the final render's SSH glyph would
+	// land below and strand a duplicate pending header above the final frame
+	// ([#3177](https://github.com/can1357/oh-my-pi/issues/3177)).
+	provisionalPartialResult: true,
 };

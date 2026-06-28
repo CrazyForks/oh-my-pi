@@ -6,7 +6,7 @@ import { convertMessages as convertOpenAICompletionsMessages } from "@oh-my-pi/p
 import {
 	appendResponsesToolResultMessages,
 	convertResponsesInputContent,
-} from "@oh-my-pi/pi-ai/providers/openai-responses-shared";
+} from "@oh-my-pi/pi-ai/providers/openai-shared";
 import { NON_VISION_IMAGE_PLACEHOLDER } from "@oh-my-pi/pi-ai/providers/vision-guard";
 import type { Api, AssistantMessage, Context, Model, ModelSpec, ToolResultMessage, Usage } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
@@ -34,6 +34,7 @@ const compat: ResolvedOpenAICompat = {
 	supportsUsageInStreaming: true,
 	supportsToolChoice: true,
 	supportsForcedToolChoice: true,
+	supportsNamedToolChoice: true,
 	disableReasoningOnForcedToolChoice: false,
 	disableReasoningOnToolChoice: false,
 	maxTokensField: "max_completion_tokens",
@@ -42,15 +43,28 @@ const compat: ResolvedOpenAICompat = {
 	requiresThinkingAsText: false,
 	requiresMistralToolIds: false,
 	thinkingFormat: "openai",
+	reasoningDisableMode: "lowest-effort",
+	omitReasoningEffort: false,
+	includeEncryptedReasoning: true,
+	filterReasoningHistory: false,
 	reasoningContentField: "reasoning_content",
 	requiresReasoningContentForToolCalls: false,
+	requiresReasoningContentForAllAssistantTurns: false,
 	allowsSyntheticReasoningContentForToolCalls: true,
+	replayReasoningContent: false,
+	qwenPreserveThinking: false,
 	requiresAssistantContentForToolCalls: false,
 	openRouterRouting: {},
 	vercelGatewayRouting: {},
 	extraBody: {},
 	supportsStrictMode: true,
 	toolStrictMode: "none",
+	wireModelIdMode: "raw",
+	stripDeepseekSpecialTokens: false,
+	reasoningDeltasMayBeCumulative: false,
+	emptyLengthFinishIsContextError: false,
+	usesOpenAIToolCallIdLimit: false,
+	dropThinkingWhenReasoningEffort: false,
 };
 
 function makeModel<TApi extends Api>(api: TApi, provider: Model["provider"]): Model<TApi> {
@@ -160,6 +174,7 @@ describe("issue #967 vision guard", () => {
 				{ type: "image", mimeType: "image/png", data: "ZmFrZQ==" },
 			],
 			false,
+			model.compat.supportsImageDetailOriginal,
 		);
 		expect(countTaggedValues(userContent, "input_image")).toBe(0);
 		expect(userContent).toEqual([
@@ -176,6 +191,7 @@ describe("issue #967 vision guard", () => {
 			]),
 			model,
 			true,
+			model.compat.supportsImageDetailOriginal,
 			new Set(["call_1"]),
 		);
 		expect(countTaggedValues(payload, "input_image")).toBe(0);

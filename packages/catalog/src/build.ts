@@ -10,7 +10,8 @@
  * compat per request.
  */
 import { buildAnthropicCompat } from "./compat/anthropic";
-import { buildOpenAICompat, buildOpenAIResponsesCompat } from "./compat/openai";
+import { buildDevinCompat } from "./compat/devin";
+import { buildOpenAICompat, buildOpenAIResponsesCompat, buildOpenRouterCompat } from "./compat/openai";
 import { resolveModelThinking } from "./model-thinking";
 import type { Api, CompatOf, Model, ModelSpec } from "./types";
 import { cleanModelName } from "./utils";
@@ -28,6 +29,8 @@ export function buildModel<TApi extends Api>(spec: ModelSpec<TApi>): Model<TApi>
 
 export function buildCompat(spec: ModelSpec<Api>): CompatOf<Api> {
 	switch (spec.api) {
+		case "openrouter":
+			return buildOpenRouterCompat(spec as ModelSpec<"openrouter">);
 		case "openai-completions":
 			return buildOpenAICompat(spec as ModelSpec<"openai-completions">);
 		case "openai-responses":
@@ -36,6 +39,8 @@ export function buildCompat(spec: ModelSpec<Api>): CompatOf<Api> {
 			return buildOpenAIResponsesCompat(spec as ModelSpec<"openai-responses">);
 		case "anthropic-messages":
 			return buildAnthropicCompat(spec as ModelSpec<"anthropic-messages">);
+		case "devin-agent":
+			return buildDevinCompat(spec as ModelSpec<"devin-agent">);
 		default:
 			return undefined;
 	}

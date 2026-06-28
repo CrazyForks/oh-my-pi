@@ -74,6 +74,8 @@ export const TRUNCATE_LENGTHS = {
 	LINE: 110,
 	/** Very short (task previews, badges) */
 	SHORT: 40,
+	/** Idle recap status line (~40-word LLM reply) */
+	RECAP: 280,
 } as const;
 
 /** Keybinding action that toggles tool-output expansion. */
@@ -97,6 +99,17 @@ export function expandKeyHint(): string {
 export function getPreviewLines(text: string, maxLines: number, maxLineLen: number, ellipsis?: Ellipsis): string[] {
 	const lines = text.split("\n").filter(l => l.trim());
 	return lines.slice(0, maxLines).map(l => truncateToWidth(l.trim(), maxLineLen, ellipsis));
+}
+
+/**
+ * Collapse a possibly multi-line string into a single line, then truncate it to
+ * `maxWidth` display cells. {@link truncateToWidth} alone caps width but
+ * newlines are zero-width, so multi-line content (markdown briefs, tool args,
+ * provider errors) would otherwise spill a single status row across several
+ * visual lines. Whitespace runs collapse to one space, so tabs are handled too.
+ */
+export function previewLine(text: string, maxWidth: number, ellipsis?: Ellipsis): string {
+	return truncateToWidth(text.replace(/\s+/g, " ").trim(), maxWidth, ellipsis);
 }
 
 // =============================================================================
@@ -657,7 +670,10 @@ export function truncateDiffByHunk(
 export function shortenPath(filePath: string, homeDir?: string): string {
 	const home = homeDir ?? os.homedir();
 	if (home && filePath.startsWith(home)) {
-		return `~${filePath.slice(home.length)}`;
+		const suffix = filePath.slice(home.length);
+		if (suffix === "" || suffix.startsWith(path.posix.sep) || suffix.startsWith(path.win32.sep)) {
+			return `~${suffix.replaceAll(path.win32.sep, path.posix.sep)}`;
+		}
 	}
 	return filePath;
 }
@@ -694,6 +710,9 @@ export function formatScreenshot(opts: {
 	} else {
 		lines.push(`Format: ${opts.resized.mimeType} (${(opts.resized.buffer.length / 1024).toFixed(2)} KB)`);
 		lines.push(`Dimensions: ${opts.resized.width}x${opts.resized.height}`);
+	}
+	if (opts.resized.decodeFailed) {
+		lines.push("Resize: image decoder failed; using original image bytes");
 	}
 	const dimensionNote = formatDimensionNote(opts.resized);
 	if (dimensionNote) {

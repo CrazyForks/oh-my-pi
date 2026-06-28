@@ -170,7 +170,7 @@ export class ExtensionUiController {
 
 				// Reset and update status line
 				this.ctx.statusLine.invalidate();
-				this.ctx.statusLine.setSessionStartTime(Date.now());
+				this.ctx.statusLine.resetActiveTime();
 				this.ctx.updateEditorTopBorder();
 				this.ctx.ui.requestRender();
 
@@ -810,8 +810,12 @@ export class ExtensionUiController {
 
 	#applyCustomMessageDisplay(wasStreaming: boolean, shouldDisplay: boolean | undefined): void {
 		// For non-streaming cases with display=true, update UI
-		// (streaming cases update via message_end event)
-		if (!wasStreaming && shouldDisplay) {
+		// (streaming cases update via message_end event).
+		// Gate on initialChatRendered (#1955): an extension's session_start
+		// sendMessage({display:true}) runs before renderInitialMessages, which would
+		// re-render from session entries AND re-append via preserveExistingChat,
+		// duplicating the message. After the initial render the rebuild must run.
+		if (!wasStreaming && shouldDisplay && this.ctx.initialChatRendered) {
 			this.ctx.rebuildChatFromMessages();
 		}
 	}

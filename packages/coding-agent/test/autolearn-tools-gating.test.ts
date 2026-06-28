@@ -10,7 +10,9 @@ import type { MnemopiSessionState } from "@oh-my-pi/pi-coding-agent/mnemopi/stat
 import { createTools, type ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { LearnTool } from "@oh-my-pi/pi-coding-agent/tools/learn";
 import { ManageSkillTool } from "@oh-my-pi/pi-coding-agent/tools/manage-skill";
+import { removeWithRetries } from "@oh-my-pi/pi-utils";
 import { getAgentDir, setAgentDir } from "@oh-my-pi/pi-utils/dirs";
+import { type } from "arktype";
 
 function makeSession(
 	settingsOverrides: Partial<Record<SettingPath, unknown>> = {},
@@ -118,7 +120,7 @@ describe("manage_skill execute", () => {
 		spyOn(os, "homedir").mockRestore();
 		setAgentDir(originalAgentDir);
 		resetActiveSkillsForTests();
-		await fs.rm(tempHome, { recursive: true, force: true });
+		await removeWithRetries(tempHome);
 	});
 
 	const tool = () => ManageSkillTool.createIf(makeSession({ "autolearn.enabled": true }))!;
@@ -141,10 +143,10 @@ describe("manage_skill execute", () => {
 
 	it("schema rejects create/update without description+body but allows delete", () => {
 		const schema = tool().parameters;
-		expect(schema.safeParse({ action: "create", name: "x" }).success).toBe(false);
-		expect(schema.safeParse({ action: "update", name: "x", description: "d" }).success).toBe(false);
-		expect(schema.safeParse({ action: "create", name: "x", description: "d", body: "b" }).success).toBe(true);
-		expect(schema.safeParse({ action: "delete", name: "x" }).success).toBe(true);
+		expect(schema({ action: "create", name: "x" }) instanceof type.errors).toBe(true);
+		expect(schema({ action: "update", name: "x", description: "d" }) instanceof type.errors).toBe(true);
+		expect(schema({ action: "create", name: "x", description: "d", body: "b" }) instanceof type.errors).toBe(false);
+		expect(schema({ action: "delete", name: "x" }) instanceof type.errors).toBe(false);
 	});
 
 	it("refuses to create a managed skill an authored skill of the same name would shadow", async () => {
@@ -211,7 +213,7 @@ describe("learn execute", () => {
 	afterEach(async () => {
 		spyOn(os, "homedir").mockRestore();
 		setAgentDir(originalAgentDir);
-		await fs.rm(tempHome, { recursive: true, force: true });
+		await removeWithRetries(tempHome);
 	});
 
 	it("stores a lesson to memory without writing a skill when no skill payload", async () => {

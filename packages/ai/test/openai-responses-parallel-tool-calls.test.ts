@@ -13,8 +13,8 @@
 // `output_item.done` event must be routed by `output_index`/`item_id`, not by
 // arrival order.
 import { describe, expect, test } from "bun:test";
-import { processResponsesStream } from "@oh-my-pi/pi-ai/providers/openai-responses-shared";
 import type { ResponseStreamEvent } from "@oh-my-pi/pi-ai/providers/openai-responses-wire";
+import { processResponsesStream } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 
@@ -65,8 +65,8 @@ describe("processResponsesStream: parallel function_call items", () => {
 		const emitted: EmittedEvent[] = [];
 		const stream = { push: (e: unknown) => emitted.push(e as EmittedEvent), end: () => {} } as never;
 
-		const argsA = JSON.stringify({ _i: "Reading test", path: "test.txt" });
-		const argsB = JSON.stringify({ _i: "Reading test", path: "test.md" });
+		const argsA = JSON.stringify({ i: "Reading test", path: "test.txt" });
+		const argsB = JSON.stringify({ i: "Reading test", path: "test.md" });
 
 		await processResponsesStream(
 			makeStream([
@@ -125,8 +125,8 @@ describe("processResponsesStream: parallel function_call items", () => {
 		expect(blockA?.type).toBe("toolCall");
 		expect(blockB?.type).toBe("toolCall");
 		if (blockA?.type !== "toolCall" || blockB?.type !== "toolCall") throw new Error("expected toolCalls");
-		expect(blockA.arguments).toEqual({ _i: "Reading test", path: "test.txt" });
-		expect(blockB.arguments).toEqual({ _i: "Reading test", path: "test.md" });
+		expect(blockA.arguments).toEqual({ i: "Reading test", path: "test.txt" });
+		expect(blockB.arguments).toEqual({ i: "Reading test", path: "test.md" });
 
 		const ends = emitted.filter(e => e.type === "toolcall_end") as Array<{
 			toolCall: { id: string; arguments: Record<string, unknown> };
@@ -134,8 +134,8 @@ describe("processResponsesStream: parallel function_call items", () => {
 		}>;
 		expect(ends).toHaveLength(2);
 		const byCallId = new Map(ends.map(e => [e.toolCall.id.split("|")[0], e]));
-		expect(byCallId.get("call_a")?.toolCall.arguments).toEqual({ _i: "Reading test", path: "test.txt" });
-		expect(byCallId.get("call_b")?.toolCall.arguments).toEqual({ _i: "Reading test", path: "test.md" });
+		expect(byCallId.get("call_a")?.toolCall.arguments).toEqual({ i: "Reading test", path: "test.txt" });
+		expect(byCallId.get("call_b")?.toolCall.arguments).toEqual({ i: "Reading test", path: "test.md" });
 		expect(byCallId.get("call_a")?.contentIndex).toBe(0);
 		expect(byCallId.get("call_b")?.contentIndex).toBe(1);
 

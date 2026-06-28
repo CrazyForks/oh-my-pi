@@ -16,7 +16,7 @@ function createContext() {
 	const ctx = {
 		isInitialized: true,
 		settings: { get: () => false },
-		statusLine: { invalidate: vi.fn() },
+		statusLine: { invalidate: vi.fn(), markActivityStart: vi.fn(), markActivityEnd: vi.fn() },
 		updateEditorTopBorder: vi.fn(),
 		pendingTools,
 		hideThinkingBlock: false,
@@ -25,6 +25,7 @@ function createContext() {
 		ensureLoadingAnimation,
 		ui: { requestRender: vi.fn() },
 		session,
+		viewSession: session,
 	} as unknown as InteractiveModeContext;
 	return { ctx, pendingTools, setWorkingMessage, session };
 }
@@ -38,7 +39,7 @@ function toolStartWithIntent(toolCallId: string, intent: string): AgentSessionEv
 	return {
 		type: "tool_execution_start",
 		toolCallId,
-		toolName: "search",
+		toolName: "grep",
 		args: {},
 		intent,
 	} as unknown as AgentSessionEvent;

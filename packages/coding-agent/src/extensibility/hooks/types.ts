@@ -1,7 +1,8 @@
 import type { ImageContent, Message, Model, TextContent } from "@oh-my-pi/pi-ai";
 import type { Component, TUI } from "@oh-my-pi/pi-tui";
 import type { logger as PiLogger } from "@oh-my-pi/pi-utils";
-import type { z } from "zod/v4";
+import type { Type } from "arktype";
+import type * as zod from "zod/v4";
 import type { ModelRegistry } from "../../config/model-registry";
 import type { EditToolDetails } from "../../edit";
 import type { ExecOptions, ExecResult } from "../../exec/exec";
@@ -9,7 +10,7 @@ import type * as PiCodingAgent from "../../index";
 import type { Theme } from "../../modes/theme/theme";
 import type { HookMessage } from "../../session/messages";
 import type { ReadonlySessionManager, SessionManager } from "../../session/session-manager";
-import type { BashToolDetails, FindToolDetails, ReadToolDetails, SearchToolDetails } from "../../tools";
+import type { BashToolDetails, GlobToolDetails, GrepToolDetails, ReadToolDetails } from "../../tools";
 import type {
 	AgentEndEvent,
 	AgentStartEvent,
@@ -351,16 +352,16 @@ export interface WriteToolResultEvent extends ToolResultEventBase {
 	details: undefined;
 }
 
-/** Tool result event for search tool */
-export interface SearchToolResultEvent extends ToolResultEventBase {
-	toolName: "search";
-	details: SearchToolDetails | undefined;
+/** Tool result event for grep tool */
+export interface GrepToolResultEvent extends ToolResultEventBase {
+	toolName: "grep";
+	details: GrepToolDetails | undefined;
 }
 
-/** Tool result event for find tool */
-export interface FindToolResultEvent extends ToolResultEventBase {
-	toolName: "find";
-	details: FindToolDetails | undefined;
+/** Tool result event for glob tool */
+export interface GlobToolResultEvent extends ToolResultEventBase {
+	toolName: "glob";
+	details: GlobToolDetails | undefined;
 }
 
 /** Tool result event for custom/unknown tools */
@@ -379,8 +380,8 @@ export type ToolResultEvent =
 	| ReadToolResultEvent
 	| EditToolResultEvent
 	| WriteToolResultEvent
-	| SearchToolResultEvent
-	| FindToolResultEvent
+	| GrepToolResultEvent
+	| GlobToolResultEvent
 	| CustomToolResultEvent;
 
 /**
@@ -582,10 +583,12 @@ export interface HookAPI {
 
 	/** File logger for error/warning/debug messages */
 	logger: typeof PiLogger;
-	/** Injected zod-backed typebox shim (legacy/compat — prefer `zod`). */
+	/** Injected zod-backed typebox shim (legacy/compat — prefer `arktype`). */
 	typebox: typeof TypeBox;
-	/** Injected zod module for Zod-authored hooks. */
-	zod: typeof z;
+	/** Injected arktype module for arktype-authored hooks. */
+	arktype: typeof Type;
+	/** Injected zod/v4 module for canonical hook validation. */
+	zod: typeof zod;
 	/** Injected pi-coding-agent exports */
 	pi: typeof PiCodingAgent;
 }

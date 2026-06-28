@@ -4,7 +4,6 @@ import hashlineDescription from "@oh-my-pi/hashline/prompt.md" with { type: "tex
 import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallback } from "@oh-my-pi/pi-agent-core";
 import type { ToolExample } from "@oh-my-pi/pi-ai";
 import { prompt } from "@oh-my-pi/pi-utils";
-import type { z } from "zod/v4";
 import {
 	createLspWritethrough,
 	type FileDiagnosticsResult,
@@ -20,7 +19,7 @@ import type { DeferredDiagnosticsEntry, ToolSession } from "../tools";
 import { truncateForPrompt } from "../tools/approval";
 import { isInternalUrlPath } from "../tools/path-utils";
 import { type EditMode, normalizeEditMode, resolveEditMode } from "../utils/edit-mode";
-import { executeHashlineSingle, type HashlineParams, hashlineEditParamsSchema } from "./hashline";
+import { executeHashlineSingle, hashlineEditParamsSchema } from "./hashline";
 import { type ApplyPatchParams, applyPatchSchema, expandApplyPatchToEntries } from "./modes/apply-patch";
 import applyPatchGrammar from "./modes/apply-patch.lark" with { type: "text" };
 import { executePatchSingle, type PatchEditEntry, type PatchParams, patchEditSchema } from "./modes/patch";
@@ -46,6 +45,8 @@ type TInput =
 	| typeof patchEditSchema
 	| typeof hashlineEditParamsSchema
 	| typeof applyPatchSchema;
+
+type HashlineParams = typeof hashlineEditParamsSchema.infer;
 
 type EditParams = ReplaceParams | PatchParams | HashlineParams | ApplyPatchParams;
 
@@ -153,6 +154,7 @@ async function executeApplyPatchPerFile(
 				diagnostics: details?.diagnostics,
 				op: details?.op,
 				move: details?.move,
+				sourcePath: details?.sourcePath,
 				meta: details?.meta,
 				oldText: details?.oldText,
 				newText: details?.newText,
@@ -395,6 +397,27 @@ export class EditTool implements AgentTool<TInput> {
 		return EDIT_MODE_STRATEGIES[this.mode].matcherDigest(args);
 	}
 
+	/**
+	 * Project the streamed args onto their target file paths so path-scoped
+	 * stream matchers (e.g. TTSR `tool:edit(*.ts)` globs) match hashline and
+	 * apply_patch edits even though the path lives in the wire payload (a
+	 * section header / envelope marker) rather than a top-level argument.
+	 */
+	matcherPaths(args: unknown): readonly string[] | undefined {
+		return EDIT_MODE_STRATEGIES[this.mode].matcherPaths(args);
+	}
+
+	/**
+	 * Per-file projection of the streamed args, splitting multi-section
+	 * hashline / multi-hunk apply_patch payloads into one (path, digest) entry
+	 * per touched file. Path-scoped stream matchers (TTSR) then evaluate each
+	 * file in isolation, so a `tool:edit(*.ts)` rule never fires on text that
+	 * actually belongs to a sibling Markdown hunk.
+	 */
+	matcherEntries(args: unknown): readonly { path: string; digest: string }[] | undefined {
+		return EDIT_MODE_STRATEGIES[this.mode].matcherEntries(args);
+	}
+
 	async execute(
 		_toolCallId: string,
 		params: EditParams,
@@ -443,7 +466,7 @@ export class EditTool implements AgentTool<TInput> {
 						caption: "Multiple entries",
 						note: "All entries in one call apply to the top-level `path`; use separate calls for different files.",
 					},
-				] satisfies readonly ToolExample<z.input<typeof patchEditSchema>>[],
+				] satisfies readonly ToolExample<PatchParams>[],
 				execute: (
 					tool: EditTool,
 					params: EditParams,
@@ -479,7 +502,7 @@ export class EditTool implements AgentTool<TInput> {
 							input: '*** Begin Patch\n*** Add File: hello.txt\n+Hello world\n*** Update File: src/app.py\n*** Move to: src/main.py\n@@ def greet():\n-print("Hi")\n+print("Hello, world!")\n*** Delete File: obsolete.txt\n*** End Patch\n',
 						},
 					},
-				] satisfies readonly ToolExample<z.input<typeof applyPatchSchema>>[],
+				] satisfies readonly ToolExample<ApplyPatchParams>[],
 				execute: (
 					tool: EditTool,
 					params: EditParams,

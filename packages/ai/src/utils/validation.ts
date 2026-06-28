@@ -23,8 +23,10 @@
  * massage shapes the LLM almost got right.
  */
 import { structuredCloneJSON } from "@oh-my-pi/pi-utils";
+import { type Type, type } from "arktype";
 import type { ZodType } from "zod/v4";
 import type { $ZodIssue as ZodIssue } from "zod/v4/core";
+import * as AIError from "../error";
 import type { Tool, ToolCall } from "../types";
 import { upgradeJsonSchemaTo202012 } from "./schema/draft";
 import {
@@ -32,7 +34,8 @@ import {
 	type JsonSchemaValidationIssue,
 	validateJsonSchemaValue,
 } from "./schema/json-schema-validator";
-import { isZodSchema, zodToWireSchema } from "./schema/wire";
+import { stamp } from "./schema/stamps";
+import { arkToWireSchema, isArkSchema, isZodSchema, zodToWireSchema } from "./schema/wire";
 
 // ============================================================================
 // Type Coercion Utilities
@@ -762,10 +765,13 @@ function normalizeOptionalNullsForSchema(
 		if (!(key in nextValue)) continue;
 		const currentValue = nextValue[key];
 		const isNullish = currentValue === null || currentValue === "null";
+		const isInvalidEmptyString =
+			currentValue === "" && !required.has(key) && !branchMatchesSchema(propertySchema, currentValue);
 
-		// Strip null and the string "null" from optional fields.
-		// The LLM sometimes outputs string "null" to mean "no value".
-		if (isNullish && !required.has(key)) {
+		// Strip null/string "null" from optional fields, and strip empty
+		// strings only when the property schema would reject the explicit value.
+		// LLMs sometimes output these placeholders to mean "no value".
+		if ((isNullish || isInvalidEmptyString) && !required.has(key)) {
 			if (!changed) {
 				nextValue = { ...nextValue };
 				changed = true;
@@ -827,6 +833,105 @@ function normalizeOptionalNullsForSchema(
 	}
 
 	return { value: changed ? nextValue : value, changed };
+}
+
+// ============================================================================
+// Double-encoded object-key normalization (LLM quirk).
+// ============================================================================
+//
+// LLMs occasionally serialize an object key one time too many, so the property
+// NAME arrives as the JSON encoding of the real name — literal quote characters
+// and all (e.g. `{ "\"op\"": "done" }` decodes to the JS key `"op"`). The
+// schema never matches such a key, so it reads as an unrecognized extra and is
+// dropped by the unrecognized-key repair, later surfacing as a spurious
+// missing-required error. We walk the whole value (arrays + nested objects)
+// and rename any key that is itself the JSON encoding of a plain string back to
+// that string.
+// ============================================================================
+
+/** Max layers of accidental JSON-encoding to peel off a single object key. */
+const MAX_KEY_DECODE_DEPTH = 3;
+
+/**
+ * If `key` is the JSON encoding of a plain string (quote-wrapped and
+ * `JSON.parse`s to a string), return the decoded string; otherwise null. Peels
+ * up to {@link MAX_KEY_DECODE_DEPTH} nested encodings so multiply-encoded keys
+ * collapse in one pass. Conservative: any key that is not a quote-wrapped JSON
+ * string literal is left untouched.
+ */
+function decodeDoubleEncodedKey(key: string): string | null {
+	let current = key;
+	let decoded: string | null = null;
+	for (let depth = 0; depth < MAX_KEY_DECODE_DEPTH; depth += 1) {
+		if (current.length < 2 || current[0] !== '"' || current[current.length - 1] !== '"') break;
+		let parsed: unknown;
+		try {
+			parsed = JSON.parse(current);
+		} catch {
+			break;
+		}
+		if (typeof parsed !== "string") break;
+		current = parsed;
+		decoded = current;
+	}
+	return decoded;
+}
+
+/**
+ * Recursively unwrap object keys that were accidentally JSON-encoded an extra
+ * time. Schema-agnostic by design: such keys are dropped before any schema pass
+ * can map them, so this runs first. A key is only renamed when the decoded name
+ * differs and does not already exist on the same object — renaming would
+ * otherwise clobber a sibling and silently lose data.
+ */
+function normalizeDoubleEncodedKeys(value: unknown): { value: unknown; changed: boolean } {
+	if (Array.isArray(value)) {
+		let changed = false;
+		let next = value;
+		for (let i = 0; i < value.length; i += 1) {
+			const normalized = normalizeDoubleEncodedKeys(value[i]);
+			if (!normalized.changed) continue;
+			if (!changed) {
+				next = [...value];
+				changed = true;
+			}
+			next[i] = normalized.value;
+		}
+		return { value: changed ? next : value, changed };
+	}
+
+	if (value === null || typeof value !== "object") return { value, changed: false };
+
+	const source = value as Record<string, unknown>;
+	let changed = false;
+	const out: Record<string, unknown> = {};
+	for (const [key, entry] of Object.entries(source)) {
+		const normalizedChild = normalizeDoubleEncodedKeys(entry);
+		const nextChild = normalizedChild.changed ? normalizedChild.value : entry;
+
+		const decodedKey = decodeDoubleEncodedKey(key);
+		// `Object.hasOwn` (not `in`) so a decoded `constructor`/`toString` is not
+		// mistaken for a collision via the prototype chain.
+		const targetKey =
+			decodedKey !== null &&
+			decodedKey !== key &&
+			!Object.hasOwn(source, decodedKey) &&
+			!Object.hasOwn(out, decodedKey)
+				? decodedKey
+				: key;
+
+		if (targetKey !== key || normalizedChild.changed) changed = true;
+		// `defineProperty` so a decoded `__proto__` key becomes an own property
+		// instead of mutating the result object's prototype.
+		Object.defineProperty(out, targetKey, {
+			value: nextChild,
+			writable: true,
+			enumerable: true,
+			configurable: true,
+		});
+	}
+
+	return { value: changed ? out : value, changed };
 }
 
 // ============================================================================
@@ -917,8 +1022,15 @@ function normalizeStringEncodedArrayUnions(schema: unknown, value: unknown): { v
 		if (!trimmed.startsWith("[")) return { value, changed: false };
 		try {
 			const parsed = JSON.parse(trimmed) as unknown;
-			if (Array.isArray(parsed) && parsedArrayMatchesArrayBranch(schemaObject, parsed)) {
-				return { value: parsed, changed: true };
+			if (Array.isArray(parsed)) {
+				// Unwrap any double-encoded object keys inside the parsed array
+				// before the branch-match check; otherwise an `array<object>`
+				// branch fails to validate and the value silently stays on the
+				// string branch.
+				const candidate = normalizeDoubleEncodedKeys(parsed).value as unknown[];
+				if (parsedArrayMatchesArrayBranch(schemaObject, candidate)) {
+					return { value: candidate, changed: true };
+				}
 			}
 		} catch {
 			// Not valid JSON — leave the string alone for the validator to handle.
@@ -1139,26 +1251,30 @@ type ValidationContext =
 			json: Record<string, unknown>;
 	  }
 	| {
+			kind: "arktype";
+			ark: Type;
+			json: Record<string, unknown>;
+	  }
+	| {
 			kind: "json";
 			json: Record<string, unknown>;
 	  };
 
 /**
  * Cache the validation context derived from a tool's parameters schema.
- * Keyed by the parameters object identity, which is stable across tool
- * registrations.
+ * Keyed by the parameters object identity (stable across tool registrations),
+ * via {@link stamp} so callable ArkType schemas — and any frozen host — degrade
+ * to recompute-on-call instead of throwing on assignment.
  */
 const kValidationContext = Symbol("ai.validationContext");
-type ParamsWithValidationContext = object & { [kValidationContext]?: ValidationContext };
 function getValidationContext(tool: Tool): ValidationContext {
-	const params = tool.parameters as ParamsWithValidationContext;
-	const existing = params[kValidationContext];
-	if (existing) return existing;
-	const ctx: ValidationContext = isZodSchema(params)
-		? { kind: "zod", zod: params, json: zodToWireSchema(params) }
-		: { kind: "json", json: upgradeJsonSchemaTo202012(params) as Record<string, unknown> };
-	params[kValidationContext] = ctx;
-	return ctx;
+	return stamp(tool.parameters as object, kValidationContext, params =>
+		isArkSchema(params)
+			? { kind: "arktype", ark: params, json: arkToWireSchema(params) }
+			: isZodSchema(params)
+				? { kind: "zod", zod: params, json: zodToWireSchema(params) }
+				: { kind: "json", json: upgradeJsonSchemaTo202012(params) as Record<string, unknown> },
+	);
 }
 
 type ContextValidationResult =
@@ -1211,6 +1327,24 @@ function validateContext(ctx: ValidationContext, value: unknown): ContextValidat
 		};
 	}
 
+	if (ctx.kind === "arktype") {
+		const out = ctx.ark(value);
+		if (!(out instanceof type.errors)) {
+			return { success: true, value: preserveUnknownRootFields(value, out) };
+		}
+		// A `.narrow()`/cross-field failure can have ArkType reject while the wire
+		// JSON (its predicate dropped by the toJsonSchema fallback) accepts — then
+		// there are no json issues to coerce and we fall through to the formatted
+		// error built from ArkType's own messages.
+		const jr = validateJsonSchemaValue(ctx.json, value);
+		const flatIssues = jr.success ? [] : flattenJsonSchemaIssues(jr.issues);
+		return {
+			success: false,
+			flatIssues,
+			messages: out.map(e => `  - ${formatIssuePath(e.path)}: ${e.message}`),
+		};
+	}
+
 	const result = validateJsonSchemaValue(ctx.json, value);
 	if (result.success) return { success: true, value };
 	return {
@@ -1232,7 +1366,7 @@ const MAX_COERCION_PASSES = 5;
 export function validateToolCall(tools: Tool[], toolCall: ToolCall): ToolCall["arguments"] {
 	const tool = tools.find(t => t.name === toolCall.name);
 	if (!tool) {
-		throw new Error(`Tool "${toolCall.name}" not found`);
+		throw new AIError.ToolNotFoundError(toolCall.name);
 	}
 	return validateToolArguments(tool, toolCall);
 }
@@ -1257,20 +1391,46 @@ function truncateArgsForError(value: unknown): unknown {
 /**
  * Validates tool call arguments against the tool's schema (Zod or plain JSON
  * Schema). Applies LLM-quirk coercions (numeric strings, JSON-string
- * containers, null-for-optional, null-for-default) before declaring failure.
+ * containers, null/invalid-empty-string-for-optional, null-for-default) before
+ * declaring failure.
  *
  * @throws Error with a formatted message when validation cannot be reconciled.
  */
 export function validateToolArguments(tool: Tool, toolCall: ToolCall): ToolCall["arguments"] {
 	const originalArgs = toolCall.arguments;
+	if (originalArgs && typeof originalArgs === "object" && "__parseError" in originalArgs) {
+		const parseError = originalArgs.__parseError;
+		const rawJson = String(originalArgs.__rawJson ?? "");
+		const maxLen = 512;
+		const truncatedRawJson =
+			rawJson.length <= maxLen
+				? rawJson
+				: `${rawJson.slice(0, maxLen)}… [truncated ${rawJson.length - maxLen} chars]`;
+		throw new AIError.ValidationError(
+			`Validation failed for tool "${toolCall.name}": Tool call arguments are not valid JSON.\nParse Error: ${parseError}\nRaw JSON:\n${truncatedRawJson}`,
+		);
+	}
 	const ctx = getValidationContext(tool);
 	const { json } = ctx;
 
-	// Always normalize first — strip null and string "null" from optional
-	// fields and substitute defaults. Handles LLM outputting string "null"
-	// to mean "no value" even when validation would otherwise pass.
+	// Always normalize first — strip null/string "null" from optional fields,
+	// strip optional empty strings only when their property schema rejects the
+	// explicit value, and substitute defaults. Handles LLM outputting
+	// placeholders for "no value" even when validation would otherwise pass.
 	let normalizedArgs: unknown = originalArgs;
 	let changed = false;
+
+	// Unwrap accidentally double-JSON-encoded object keys before any schema
+	// pass. LLMs sometimes emit `{ "\"op\"": "done" }`, so the property name
+	// arrives quote-wrapped; left alone it reads as an unrecognized key, gets
+	// dropped by the coercion repair, and re-surfaces as a missing-required
+	// error. Running first means every later pass sees the corrected names.
+	const keyNormalization = normalizeDoubleEncodedKeys(normalizedArgs);
+	if (keyNormalization.changed) {
+		normalizedArgs = keyNormalization.value;
+		changed = true;
+	}
+
 	const initialNormalization = normalizeOptionalNullsForSchema(json, normalizedArgs);
 	if (initialNormalization.changed) {
 		normalizedArgs = initialNormalization.value;
@@ -1296,6 +1456,15 @@ export function validateToolArguments(tool: Tool, toolCall: ToolCall): ToolCall[
 
 		normalizedArgs = coercion.value;
 		changed = true;
+
+		// `coerceArgsFromIssues` may have just parsed a JSON-string container at
+		// the root or a nested field, exposing double-encoded keys the initial
+		// pass could not reach. Re-unwrap before the unrecognized-key repair on
+		// the next validation pass would delete them.
+		const keyNormalizationPass = normalizeDoubleEncodedKeys(normalizedArgs);
+		if (keyNormalizationPass.changed) {
+			normalizedArgs = keyNormalizationPass.value;
+		}
 
 		const nullNormalization = normalizeOptionalNullsForSchema(json, normalizedArgs);
 		if (nullNormalization.changed) {
@@ -1333,5 +1502,5 @@ export function validateToolArguments(tool: Tool, toolCall: ToolCall): ToolCall[
 		toolCall.name
 	}":\n${errors}\n\nReceived arguments:\n${JSON.stringify(receivedArgs, null, 2)}`;
 
-	throw new Error(errorMessage);
+	throw new AIError.ValidationError(errorMessage);
 }

@@ -3,14 +3,15 @@
  * renderer — a simplified TypeScript signature (derived from the wire JSON
  * Schema) plus each tool's examples in the model's native tool-call syntax.
  *
- * Tools carry live Zod v4 schemas; the dump must surface a readable signature
+ * Tools carry live arktype schemas; the dump must surface a readable signature
  * (not the schema instance's internals) and must include examples, which the
  * previous `<parameter>`-per-key JSON Schema dump dropped entirely.
  */
 import { describe, expect, it } from "bun:test";
 import type { Model, Usage } from "@oh-my-pi/pi-ai";
 import { formatSessionDumpText } from "@oh-my-pi/pi-coding-agent/session/session-dump-format";
-import { z } from "zod/v4";
+import { INTENT_FIELD } from "@oh-my-pi/pi-wire";
+import { type } from "arktype";
 
 const ZERO_USAGE: Usage = {
 	input: 0,
@@ -24,17 +25,19 @@ const ZERO_USAGE: Usage = {
 const HARMONY_MODEL = { provider: "openai", id: "gpt-5", name: "GPT-5" } as Model;
 
 describe("formatSessionDumpText tool parameters", () => {
-	it("renders Zod schemas as a TypeScript signature, not schema internals", () => {
+	it("renders arktype schemas as a TypeScript signature, not schema internals", () => {
+		const webSearchSchema = type({
+			"query /** search query */": "string",
+			"recency?": "'day' | 'week'",
+		});
+
 		const out = formatSessionDumpText({
 			messages: [],
 			tools: [
 				{
 					name: "web_search",
 					description: "Searches the web.",
-					parameters: z.object({
-						query: z.string().describe("search query"),
-						recency: z.enum(["day", "week"]).optional(),
-					}),
+					parameters: webSearchSchema,
 				},
 			],
 		});
@@ -44,9 +47,9 @@ describe("formatSessionDumpText tool parameters", () => {
 		expect(out).toContain("/** search query */");
 		expect(out).toContain("query: string;");
 		expect(out).toContain('recency?: "day" | "week";');
-		// Live Zod instance internals must never leak into the dump.
-		expect(out).not.toContain("_zod");
-		expect(out).not.toContain("ZodObject");
+		// Arktype JSON Schema should not leak arktype internals into the dump.
+		expect(out).not.toContain("_arktype");
+		expect(out).not.toContain("ArkType");
 		// Tool params are no longer emitted as XML <parameter> elements.
 		expect(out).not.toContain('<parameter name="type">');
 	});
@@ -73,13 +76,15 @@ describe("formatSessionDumpText tool parameters", () => {
 	});
 
 	it("includes tool examples in the model's native syntax", () => {
+		const findSchema = type({ paths: "string[]" });
+
 		const out = formatSessionDumpText({
 			messages: [],
 			tools: [
 				{
-					name: "find",
-					description: "Finds files.",
-					parameters: z.object({ paths: z.array(z.string()) }),
+					name: "glob",
+					description: "Globs files.",
+					parameters: findSchema,
 					examples: [{ call: { paths: ["src/**/*.ts"] } }],
 				},
 			],
@@ -87,7 +92,40 @@ describe("formatSessionDumpText tool parameters", () => {
 
 		expect(out).toContain("## Available Tools");
 		expect(out).toContain("<examples>");
-		expect(out).toContain('<invoke name="find">');
+		expect(out).toContain('<invoke name="glob">');
+	});
+
+	it("omits the Available Tools section if inlineToolDescriptors is true", () => {
+		const out = formatSessionDumpText({
+			messages: [],
+			inlineToolDescriptors: true,
+			tools: [
+				{
+					name: "web_search",
+					description: "Searches the web.",
+					parameters: { type: "object" },
+				},
+			],
+		});
+
+		expect(out).not.toContain("## Available Tools");
+	});
+
+	it("does not falsely omit the Available Tools section even if systemPrompt contains tool headings", () => {
+		const out = formatSessionDumpText({
+			messages: [],
+			systemPrompt: ["# Inventory\nThis is a rule discussing # Tool: web_search.\nNever call it directly."],
+			inlineToolDescriptors: false,
+			tools: [
+				{
+					name: "web_search",
+					description: "Searches the web.",
+					parameters: { type: "object" },
+				},
+			],
+		});
+
+		expect(out).toContain("## Available Tools");
 	});
 });
 
@@ -105,7 +143,7 @@ describe("formatSessionDumpText markdown-headings transcript", () => {
 							type: "toolCall",
 							id: "c1",
 							name: "read",
-							arguments: { _i: "Reading the file", path: "src/foo.ts" },
+							arguments: { [INTENT_FIELD]: "Reading the file", path: "src/foo.ts" },
 						},
 					],
 					api: "mock",
@@ -132,9 +170,9 @@ describe("formatSessionDumpText markdown-headings transcript", () => {
 		expect(out).toContain("### Tool Result: read");
 		expect(out).toContain("### Tool Call: read");
 		expect(out).toContain("path: src/foo.ts");
-		// The `_i` intent renders as a `//` comment under the heading, never inside the YAML args.
+		// The `i` intent renders as a `//` comment under the heading, never inside the YAML args.
 		expect(out).toContain("// Reading the file");
-		expect(out).not.toContain("_i:");
+		expect(out).not.toContain(`${INTENT_FIELD}:`);
 		// Tool calls render as a readable heading + YAML, never the <invoke>/<parameter> XML.
 		expect(out).not.toContain("<invoke ");
 		expect(out).not.toContain("<parameter ");

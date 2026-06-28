@@ -9,7 +9,7 @@ import type {
 import type { Component } from "@oh-my-pi/pi-tui";
 import { ImageProtocol, TERMINAL } from "@oh-my-pi/pi-tui";
 import { getProjectDir, isEnoent, logger, prompt } from "@oh-my-pi/pi-utils";
-import { z } from "zod/v4";
+import { type } from "arktype";
 import { type BashResult, executeBash } from "../exec/bash-executor";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import { InternalUrlRouter } from "../internal-urls";
@@ -19,7 +19,7 @@ import bashDescription from "../prompts/tools/bash.md" with { type: "text" };
 import type { ClientBridgeTerminalExitStatus, ClientBridgeTerminalOutput } from "../session/client-bridge";
 import { DEFAULT_MAX_BYTES, enforceInlineByteCap, streamTailUpdates, TailBuffer } from "../session/streaming-output";
 import { renderStatusLine } from "../tui";
-import { CachedOutputBlock, markFramedBlockComponent } from "../tui/output-block";
+import { CachedOutputBlock, markFramedBlockComponent, outputBlockContentWidth } from "../tui/output-block";
 import { getSixelLineMask } from "../utils/sixel";
 import type { ToolSession } from ".";
 import { truncateForPrompt } from "./approval";
@@ -100,16 +100,21 @@ async function saveBashOriginalArtifact(session: ToolSession, originalText: stri
 	}
 }
 
-const bashSchemaBase = z.object({
-	command: z.string().describe("command to execute"),
-	env: z.record(z.string().regex(BASH_ENV_NAME_PATTERN), z.string()).optional().describe("extra env vars"),
-	timeout: z.number().default(300).describe("timeout in seconds").optional(),
-	cwd: z.string().describe("working directory").optional(),
-	pty: z.boolean().describe("run in pty mode").optional(),
+const bashSchemaBase = type({
+	command: type("string").describe("command to execute"),
+	"env?": type({ "[string]": "string" }).describe("extra env vars"),
+	"timeout?": type("number").describe("timeout in seconds"),
+	"cwd?": type("string").describe("working directory"),
+	"pty?": type("boolean").describe("run in pty mode"),
 });
 
-const bashSchemaWithAsync = bashSchemaBase.extend({
-	async: z.boolean().describe("run in background").optional(),
+const bashSchemaWithAsync = type({
+	command: "string",
+	"env?": { "[string]": "string" },
+	"timeout?": "number",
+	"cwd?": "string",
+	"pty?": "boolean",
+	"async?": type("boolean").describe("run in background"),
 });
 
 type BashToolSchema = typeof bashSchemaBase | typeof bashSchemaWithAsync;
@@ -349,7 +354,7 @@ function stripExitCodeNotice(text: string, exitCode: number | undefined): string
  *
  * Executes bash commands with optional timeout and working directory.
  */
-export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
+export class BashTool implements AgentTool<typeof bashSchemaBase | typeof bashSchemaWithAsync, BashToolDetails> {
 	readonly name = "bash";
 	readonly approval = (args: unknown): ToolApprovalDecision => {
 		const rawCommand = (args as Partial<BashToolInput>).command;
@@ -394,8 +399,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			autoBackgroundThresholdSeconds: Math.max(0, Math.floor(this.#autoBackgroundThresholdMs / 1000)),
 			hasAstGrep: this.session.settings.get("astGrep.enabled"),
 			hasAstEdit: this.session.settings.get("astEdit.enabled"),
-			hasSearch: this.session.settings.get("search.enabled"),
-			hasFind: this.session.settings.get("find.enabled"),
+			hasGrep: this.session.settings.get("grep.enabled"),
+			hasGlob: this.session.settings.get("glob.enabled"),
 		});
 	}
 
@@ -480,7 +485,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// head-retention spill, minimizer miss) may emit more than
 		// ~DEFAULT_MAX_BYTES inline. No-op for already-bounded output.
 		const cappedOutputText = await enforceInlineByteCap(outputText, {
-			label: "bash output",
 			saveArtifact: full => saveBashOriginalArtifact(this.session, full),
 		});
 
@@ -1128,9 +1132,9 @@ function getPartialJson<TArgs>(args: TArgs | undefined): string | undefined {
 }
 
 export function getBashEnvForDisplay(args: BashRenderArgs): Record<string, string> | undefined {
-	// During streaming, partial-json parsing often does not surface env values until the object closes.
-	// Recover them from the raw JSON buffer so the pending bash preview can show `NAME="..." cmd` immediately,
-	// instead of rendering only the command and making the env assignment appear at the very end.
+	// The parsed args don't always mirror the exact current stream prefix, so recover
+	// env from the raw JSON buffer to surface `NAME="..." cmd` in the preview as it
+	// streams rather than only once the args object finishes.
 	const partialEnv = extractPartialBashEnv(args.__partialJson);
 	if (partialEnv && args.env) return { ...partialEnv, ...args.env };
 	return args.env ?? partialEnv;
@@ -1330,7 +1334,14 @@ export function createShellRenderer<TArgs>(config: ShellRendererConfig<TArgs>) {
 								.map(line => uiTheme.fg("toolOutput", replaceTabs(line)))
 								.join("\n");
 							const textContent = styledOutput;
-							const result = truncateToVisualLines(textContent, previewLines, width);
+							// Cap the collapsed/streaming output to a viewport-sized tail and
+							// measure it at the box's INNER width. Otherwise a growing tail
+							// window scrolls its (mutating) rows above the live-region window
+							// and the engine re-commits a fresh snapshot every frame —
+							// spraying duplicate "… ctrl+o to expand" banners into native
+							// scrollback (the box never overflows the viewport now).
+							const previewBudget = Math.min(previewLines, previewWindow);
+							const result = truncateToVisualLines(textContent, previewBudget, outputBlockContentWidth(width));
 							if (result.skippedCount > 0) {
 								outputLines.push(
 									uiTheme.fg(

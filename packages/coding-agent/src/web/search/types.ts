@@ -4,47 +4,16 @@
  * Unified types for web search responses across supported providers.
  */
 
-export const SEARCH_PROVIDER_ORDER = [
-	"tavily",
-	"perplexity",
-	"brave",
-	"jina",
-	"kimi",
-	"anthropic",
-	"gemini",
-	"codex",
-	"zai",
-	"exa",
-	"parallel",
-	"kagi",
-	"synthetic",
-	"searxng",
-] as const;
-
-/** Supported web search providers */
-export type SearchProviderId = (typeof SEARCH_PROVIDER_ORDER)[number];
-
-export const SEARCH_PROVIDER_PREFERENCES = ["auto", ...SEARCH_PROVIDER_ORDER] as const;
-
 export const SEARCH_PROVIDER_OPTIONS = [
 	{
 		value: "auto",
 		label: "Auto",
 		description: "Automatically uses the first configured web-search provider",
 	},
-	{ value: "tavily", label: "Tavily", description: "Requires TAVILY_API_KEY" },
 	{
 		value: "perplexity",
 		label: "Perplexity",
 		description: "Uses auth when configured; explicit selection falls back to anonymous search",
-	},
-	{ value: "brave", label: "Brave", description: "Requires BRAVE_API_KEY" },
-	{ value: "jina", label: "Jina", description: "Requires JINA_API_KEY" },
-	{ value: "kimi", label: "Kimi", description: "Requires MOONSHOT_SEARCH_API_KEY or MOONSHOT_API_KEY" },
-	{
-		value: "anthropic",
-		label: "Anthropic",
-		description: "Claude's native web_search tool (uses Anthropic OAuth or ANTHROPIC_API_KEY)",
 	},
 	{
 		value: "gemini",
@@ -52,34 +21,49 @@ export const SEARCH_PROVIDER_OPTIONS = [
 		description: "Google Search grounding via Gemini (uses google-gemini-cli or google-antigravity OAuth)",
 	},
 	{
+		value: "anthropic",
+		label: "Anthropic",
+		description: "Claude's native web_search tool (uses Anthropic OAuth or ANTHROPIC_API_KEY)",
+	},
+	{
 		value: "codex",
 		label: "OpenAI",
 		description: "OpenAI's native web_search (uses ChatGPT OAuth via /login openai-codex)",
 	},
+	{ value: "xai", label: "xAI", description: "Grok web search via xAI Responses API (requires XAI_API_KEY)" },
 	{ value: "zai", label: "Z.AI", description: "Calls Z.AI webSearchPrime MCP" },
 	{ value: "exa", label: "Exa", description: "Uses Exa API when EXA_API_KEY is set; falls back to Exa MCP" },
-	{ value: "parallel", label: "Parallel", description: "Requires PARALLEL_API_KEY" },
+	{ value: "tinyfish", label: "TinyFish", description: "Requires TINYFISH_API_KEY" },
+	{ value: "jina", label: "Jina", description: "Requires JINA_API_KEY" },
 	{ value: "kagi", label: "Kagi", description: "Requires KAGI_API_KEY and Kagi Search API beta access" },
+	{ value: "tavily", label: "Tavily", description: "Requires TAVILY_API_KEY" },
+	{ value: "firecrawl", label: "Firecrawl", description: "Requires FIRECRAWL_API_KEY" },
+	{ value: "brave", label: "Brave", description: "Requires BRAVE_API_KEY" },
+	{ value: "kimi", label: "Kimi", description: "Requires MOONSHOT_SEARCH_API_KEY or MOONSHOT_API_KEY" },
+	{ value: "parallel", label: "Parallel", description: "Requires PARALLEL_API_KEY" },
 	{ value: "synthetic", label: "Synthetic", description: "Requires SYNTHETIC_API_KEY" },
 	{ value: "searxng", label: "SearXNG", description: "Requires SEARXNG_ENDPOINT or searxng.endpoint" },
+	{ value: "duckduckgo", label: "DuckDuckGo", description: "Uses DuckDuckGo Instant Answer API (no API key)" },
 ] as const;
 
-export const SEARCH_PROVIDER_LABELS: Record<SearchProviderId, string> = {
-	tavily: "Tavily",
-	perplexity: "Perplexity",
-	brave: "Brave",
-	jina: "Jina",
-	kimi: "Kimi",
-	anthropic: "Anthropic",
-	gemini: "Gemini",
-	codex: "OpenAI",
-	zai: "Z.AI",
-	exa: "Exa",
-	parallel: "Parallel",
-	kagi: "Kagi",
-	synthetic: "Synthetic",
-	searxng: "SearXNG",
-};
+/** Supported web search providers (every option except `auto`). */
+export type SearchProviderId = Exclude<(typeof SEARCH_PROVIDER_OPTIONS)[number]["value"], "auto">;
+
+/**
+ * Auto-resolution priority order. Derived from {@link SEARCH_PROVIDER_OPTIONS}
+ * (minus `auto`) so the settings/setup dropdown and `resolveProviderChain()`
+ * share one source of truth and never drift apart.
+ */
+export const SEARCH_PROVIDER_ORDER: readonly SearchProviderId[] = SEARCH_PROVIDER_OPTIONS.flatMap(option =>
+	option.value === "auto" ? [] : [option.value],
+);
+
+export const SEARCH_PROVIDER_PREFERENCES = ["auto", ...SEARCH_PROVIDER_ORDER] as const;
+
+/** Display labels, derived from {@link SEARCH_PROVIDER_OPTIONS}. */
+export const SEARCH_PROVIDER_LABELS = Object.fromEntries(
+	SEARCH_PROVIDER_OPTIONS.flatMap(option => (option.value === "auto" ? [] : [[option.value, option.label] as const])),
+) as Record<SearchProviderId, string>;
 
 export function isSearchProviderId(value: string): value is SearchProviderId {
 	return SEARCH_PROVIDER_ORDER.includes(value as SearchProviderId);
@@ -101,7 +85,7 @@ export interface SearchSource {
 	author?: string;
 }
 
-/** Citation with text reference (anthropic, perplexity) */
+/** Citation with text reference (LLM-mediated providers) */
 export interface SearchCitation {
 	url: string;
 	title: string;
@@ -121,7 +105,7 @@ export interface SearchUsage {
 /** Unified response across providers */
 export interface SearchResponse {
 	provider: SearchProviderId | "none";
-	/** Synthesized answer text (anthropic, perplexity) */
+	/** Synthesized answer text (LLM-mediated providers) */
 	answer?: string;
 	/** Search result sources */
 	sources: SearchSource[];

@@ -1,12 +1,15 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, UsageLimit, UsageReport } from "@oh-my-pi/pi-ai";
 import { type Component, truncateToWidth, visibleWidth } from "@oh-my-pi/pi-tui";
 import { getProjectDir } from "@oh-my-pi/pi-utils";
 import { $ } from "bun";
 import { settings } from "../../../config/settings";
 import type { AgentSession } from "../../../session/agent-session";
+import type { OAuthAccountIdentity } from "../../../session/auth-storage";
+import { limitMatchesActiveAccount } from "../../../slash-commands/helpers/active-oauth-account";
+import { type ActiveRepoContext, resolveActiveRepoContextSync } from "../../../utils/active-repo-context";
 import * as git from "../../../utils/git";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../../../utils/session-color";
 import { sanitizeStatusText } from "../../shared";
@@ -153,7 +156,38 @@ interface ContextUsageMemo {
 	skillsRef: readonly any[] | undefined;
 }
 
+interface ActiveRepoCache {
+	projectDir: string;
+	activeRepo: ActiveRepoContext | null;
+	effectiveGitCwd: string;
+}
+
+/**
+ * Per-{@link AgentSession} active-processing meter for the `time_spent`
+ * segment. `activeMs` is the union of every completed `agent_start`→
+ * `agent_end` window; `activeStartedAt` is the start timestamp of the
+ * currently-running window, or `null` when idle.
+ *
+ * `sessionFile` snapshots the loaded session-file path at meter-creation
+ * time. `AgentSession.switchSession` (/resume, /move, ACP fork, RPC
+ * `switch_session`, extension `switchSession`) mutates the loaded file
+ * under the same {@link AgentSession} ref, so the WeakMap key alone
+ * cannot tell two conversations apart. `#meter()` compares this snapshot
+ * against the live `session.sessionFile`, and a real-to-real change
+ * starts the meter fresh instead of crediting the new conversation with
+ * the previous one's accumulated active time. The undefined → real
+ * first-save transition does not reset, since the session identity has
+ * not changed.
+ */
+interface ActiveMeter {
+	activeMs: number;
+	activeStartedAt: number | null;
+	sessionFile: string | undefined;
+}
+
 const EMPTY_MESSAGES: readonly AgentMessage[] = [];
+const STATUS_USAGE_START_DELAY_MS = 0;
+const STATUS_USAGE_REFRESH_TIMEOUT_MS = 2_000;
 
 function hasContextSegment(segments: readonly StatusLineSegmentId[]): boolean {
 	return segments.includes("context_pct") || segments.includes("context_total");
@@ -165,6 +199,10 @@ function hasGitSegment(segments: readonly StatusLineSegmentId[]): boolean {
 function hasPrSegment(segments: readonly StatusLineSegmentId[]): boolean {
 	return segments.includes("pr");
 }
+function hasPathSegment(segments: readonly StatusLineSegmentId[]): boolean {
+	return segments.includes("path");
+}
+
 function hasGitBackedSegment(segments: readonly StatusLineSegmentId[]): boolean {
 	return hasGitSegment(segments) || hasPrSegment(segments);
 }
@@ -181,36 +219,61 @@ export class StatusLineComponent implements Component {
 	#cachedBranchCwd: string | undefined = undefined;
 	#gitWatcher: fs.FSWatcher | null = null;
 	#onBranchChange: (() => void) | null = null;
+	#disposed = false;
 	#autoCompactEnabled: boolean = true;
 	#hookStatuses: Map<string, string> = new Map();
 	#subagentCount: number = 0;
-	#sessionStartTime: number = Date.now();
+	/**
+	 * Active-processing accounting for the `time_spent` segment, keyed per
+	 * {@link AgentSession} so the focus-controller mid-turn attach path
+	 * cannot leak an unmatched synthesized `agent_start` from a subagent
+	 * into the main session's meter.
+	 *
+	 * Each meter is `{ activeMs, activeStartedAt }`: `activeMs` is the union
+	 * of every completed `agent_start`→`agent_end` window since
+	 * {@link resetActiveTime} last reset it; `activeStartedAt` is the start
+	 * timestamp of the currently-running window (or `null` when idle).
+	 * `getActiveMs()` returns `activeMs + (now - activeStartedAt)` for the
+	 * currently-attached session, so the counter ticks live during a turn
+	 * and freezes the instant the agent yields.
+	 *
+	 * WeakMap so meters die with their session (e.g. a parked subagent
+	 * dropped from the registry); the main session's meter survives focus
+	 * round-trips because the same {@link AgentSession} ref is reused.
+	 */
+	#activeMeters: WeakMap<AgentSession, ActiveMeter> = new WeakMap();
 	#planModeStatus: { enabled: boolean; paused: boolean } | null = null;
 	#loopModeStatus: { enabled: boolean } | null = null;
 	#goalModeStatus: { enabled: boolean; paused: boolean } | null = null;
 	#collabStatus: CollabStatus | null = null;
 	#focusedAgentId: string | undefined;
+	#activeRepoCache: ActiveRepoCache | undefined;
 
 	// Git status caching (1s TTL)
 	#cachedGitStatus: { staged: number; unstaged: number; untracked: number } | null = null;
+	#cachedGitStatusCwd: string | undefined = undefined;
 	#gitStatusLastFetch = 0;
-	#gitStatusInFlight = false;
+	#gitStatusInFlightCwd: string | undefined = undefined;
 
 	// PR lookup caching (invalidated on branch/repo context changes)
 	#cachedPr: { number: number; url: string } | null | undefined = undefined;
 	#cachedPrContext: PrCacheContext | undefined = undefined;
 	#prLookupInFlight = false;
 	#defaultBranch?: string;
+	#defaultBranchCwd: string | undefined = undefined;
 	#lastTokensPerSecond: number | null = null;
 	#lastTokensPerSecondTimestamp: number | null = null;
 
-	// Anthropic usage caching (5-min TTL, OAuth/sub only)
+	// Provider usage caching (5-min TTL, OAuth/sub only)
 	#cachedUsage: {
+		tier?: string;
 		fiveHour?: { percent: number; resetMinutes?: number };
 		sevenDay?: { percent: number; resetHours?: number };
 	} | null = null;
+	#cachedUsageContextKey: string | null = null;
 	#usageFetchedAt = 0;
 	#usageInFlight = false;
+	#usageStartTimer: Timer | null = null;
 	// Context-usage memo. The status line redraws on every agent event, so the
 	// hot path must not recompute context tokens unless an input changed.
 	// `getContextUsage()` anchors on the last assistant's real prompt-token
@@ -228,6 +291,7 @@ export class StatusLineComponent implements Component {
 			segmentOptions: settings.getGroup("statusLine").segmentOptions,
 			sessionAccent: settings.get("statusLine.sessionAccent"),
 			transparent: settings.get("statusLine.transparent"),
+			compactThinkingLevel: settings.get("statusLine.compactThinkingLevel"),
 		};
 	}
 	#gitEnabled(): boolean {
@@ -240,6 +304,18 @@ export class StatusLineComponent implements Component {
 		);
 	}
 
+	#resolveActiveRepoCache(): ActiveRepoCache {
+		const projectDir = getProjectDir();
+		if (this.#activeRepoCache?.projectDir === projectDir) {
+			return this.#activeRepoCache;
+		}
+
+		const activeRepo = resolveActiveRepoContextSync(projectDir);
+		const effectiveGitCwd = activeRepo?.repoRoot ?? projectDir;
+		this.#activeRepoCache = { projectDir, activeRepo, effectiveGitCwd };
+		return this.#activeRepoCache;
+	}
+
 	/**
 	 * Re-point the status line at another session (focus proxy). Invalidate: model/context/usage all derive
 	 * from it. `focusedAgentId` is the focused subagent id while the view is proxied, undefined for main.
@@ -249,8 +325,28 @@ export class StatusLineComponent implements Component {
 		if (!sessionChanged && this.#focusedAgentId === focusedAgentId) return;
 		this.session = session;
 		this.#focusedAgentId = focusedAgentId;
-		if (sessionChanged) this.#invalidateSessionCaches();
+		if (sessionChanged) {
+			this.#invalidateSessionCaches();
+			this.#closeStaleActiveWindow();
+		}
 		this.invalidate();
+	}
+
+	/**
+	 * Drop a meter's in-flight window when the newly-attached session is no
+	 * longer streaming. Handles the case where the focus controller
+	 * synthesized an `agent_start` on a mid-turn attach but the matching
+	 * real `agent_end` never reached us — the user detached before it
+	 * fired, and re-focusing later (after the agent finished) would
+	 * otherwise tick over the entire detached gap. Crediting that gap to
+	 * `activeMs` would be wrong (the agent finished at some point we never
+	 * observed), so the window is dropped rather than folded in.
+	 */
+	#closeStaleActiveWindow(): void {
+		const meter = this.#meter();
+		if (meter.activeStartedAt === null) return;
+		if (this.session.isStreaming) return;
+		meter.activeStartedAt = null;
 	}
 
 	updateSettings(settings: StatusLineSettings): void {
@@ -276,8 +372,84 @@ export class StatusLineComponent implements Component {
 		return this.#subagentCount;
 	}
 
-	setSessionStartTime(time: number): void {
-		this.#sessionStartTime = time;
+	/**
+	 * Reset the currently-attached session's active-time accumulators so
+	 * the `time_spent` segment starts from zero. Called from `/clear`,
+	 * fresh-session, and joined-collab paths; both the completed
+	 * accumulator and any in-flight window are dropped, so a reset
+	 * mid-turn ignores the running window (the matching `markActivityEnd`
+	 * will see an idle meter and no-op).
+	 */
+	resetActiveTime(): void {
+		const meter = this.#meter();
+		meter.activeMs = 0;
+		meter.activeStartedAt = null;
+	}
+
+	/**
+	 * Mark the currently-attached session as having started a unit of
+	 * active processing. Idempotent: a second start while a window is
+	 * already open is a no-op, so reentrant `agent_start` events (e.g.
+	 * nested auto-compaction loops, focus-controller mid-turn attach onto
+	 * an already-running window) do not double-count.
+	 */
+	markActivityStart(): void {
+		const meter = this.#meter();
+		if (meter.activeStartedAt !== null) return;
+		meter.activeStartedAt = Date.now();
+	}
+
+	/**
+	 * Close the currently-attached session's open active-processing
+	 * window, folding its elapsed time into the accumulator. Idempotent
+	 * when the meter is already idle so callers can fire it on every
+	 * `agent_end` without guarding.
+	 */
+	markActivityEnd(): void {
+		const meter = this.#meter();
+		if (meter.activeStartedAt === null) return;
+		meter.activeMs += Math.max(0, Date.now() - meter.activeStartedAt);
+		meter.activeStartedAt = null;
+	}
+
+	/**
+	 * Snapshot of total active-processing time for the currently-attached
+	 * session, including any in-flight window. Exposed for the segment
+	 * context builder; tests assert against this too.
+	 */
+	getActiveMs(): number {
+		const meter = this.#meter();
+		if (meter.activeStartedAt === null) return meter.activeMs;
+		return meter.activeMs + Math.max(0, Date.now() - meter.activeStartedAt);
+	}
+
+	/**
+	 * Return (lazily creating) the meter for the currently-attached
+	 * session. Detects an in-place session-file swap under the same
+	 * {@link AgentSession} ref (`switchSession` paths: `/resume`, `/move`,
+	 * ACP fork/load, RPC `switch_session`, extension `switchSession`):
+	 * a real-to-real change starts the meter fresh so the new
+	 * conversation does not inherit the previous one's accumulated active
+	 * time. The undefined → real first-save transition only refreshes the
+	 * snapshot — the conversation identity has not changed.
+	 */
+	#meter(): ActiveMeter {
+		const currentFile = this.session.sessionFile;
+		let meter = this.#activeMeters.get(this.session);
+		if (meter) {
+			const switched =
+				currentFile !== undefined && meter.sessionFile !== undefined && meter.sessionFile !== currentFile;
+			if (switched) {
+				meter = undefined;
+			} else {
+				meter.sessionFile = currentFile;
+			}
+		}
+		if (!meter) {
+			meter = { activeMs: 0, activeStartedAt: null, sessionFile: currentFile };
+			this.#activeMeters.set(this.session, meter);
+		}
+		return meter;
 	}
 
 	setPlanModeStatus(status: { enabled: boolean; paused: boolean } | undefined): void {
@@ -320,7 +492,8 @@ export class StatusLineComponent implements Component {
 			return;
 		}
 
-		const repository = git.repo.resolveSync(getProjectDir());
+		const { effectiveGitCwd } = this.#resolveActiveRepoCache();
+		const repository = git.repo.resolveSync(effectiveGitCwd);
 		if (!repository) return;
 
 		const watchPath = git.repo.isReftableSync(repository)
@@ -329,6 +502,7 @@ export class StatusLineComponent implements Component {
 
 		try {
 			this.#gitWatcher = fs.watch(watchPath, () => {
+				if (this.#disposed) return;
 				this.#invalidateGitCaches();
 				if (this.#onBranchChange) {
 					this.#onBranchChange();
@@ -340,16 +514,26 @@ export class StatusLineComponent implements Component {
 	}
 
 	dispose(): void {
+		this.#disposed = true;
+		this.#onBranchChange = null;
+		this.#clearUsageStartTimer();
 		if (this.#gitWatcher) {
 			this.#gitWatcher.close();
 			this.#gitWatcher = null;
 		}
 	}
 
+	#clearUsageStartTimer(): void {
+		if (!this.#usageStartTimer) return;
+		clearTimeout(this.#usageStartTimer);
+		this.#usageStartTimer = null;
+	}
+
 	invalidate(): void {
 		this.#invalidateGitCaches();
 	}
 	#invalidateSessionCaches(): void {
+		this.#clearUsageStartTimer();
 		this.#cachedUsage = null;
 		this.#usageFetchedAt = 0;
 		this.#usageInFlight = false;
@@ -364,17 +548,17 @@ export class StatusLineComponent implements Component {
 		this.#cachedBranchCwd = undefined;
 		this.#cachedPrContext = undefined;
 	}
-	#getCurrentBranch(): string | null {
+	#getCurrentBranch(effectiveGitCwd?: string): string | null {
 		if (!this.#gitEnabled()) return null;
 
-		const cwd = getProjectDir();
-		if (this.#cachedBranch !== undefined && this.#cachedBranchCwd === cwd) {
+		const gitCwd = effectiveGitCwd ?? this.#resolveActiveRepoCache().effectiveGitCwd;
+		if (this.#cachedBranch !== undefined && this.#cachedBranchCwd === gitCwd) {
 			return this.#cachedBranch;
 		}
 
-		const head = git.head.resolveSync(cwd);
+		const head = git.head.resolveSync(gitCwd);
 		const gitHeadPath = head?.headPath ?? null;
-		this.#cachedBranchCwd = cwd;
+		this.#cachedBranchCwd = gitCwd;
 		this.#cachedBranchRepoId = gitHeadPath;
 		if (!head) {
 			this.#cachedBranch = null;
@@ -386,11 +570,18 @@ export class StatusLineComponent implements Component {
 		return this.#cachedBranch ?? null;
 	}
 
-	#isDefaultBranch(branch: string): boolean {
+	#isDefaultBranch(branch: string, effectiveGitCwd: string): boolean {
+		if (this.#defaultBranchCwd !== effectiveGitCwd) {
+			this.#defaultBranch = undefined;
+			this.#defaultBranchCwd = effectiveGitCwd;
+		}
+
 		if (this.#defaultBranch === undefined) {
 			this.#defaultBranch = "main";
+			const lookupCwd = effectiveGitCwd;
 			(async () => {
-				const resolved = await git.branch.default(getProjectDir());
+				const resolved = await git.branch.default(lookupCwd);
+				if (this.#disposed || this.#defaultBranchCwd !== lookupCwd) return;
 				if (resolved) {
 					this.#defaultBranch = resolved;
 					if (this.#onBranchChange) {
@@ -402,32 +593,43 @@ export class StatusLineComponent implements Component {
 		return branch === this.#defaultBranch;
 	}
 
-	#getGitStatus(): { staged: number; unstaged: number; untracked: number } | null {
+	#getGitStatus(effectiveGitCwd?: string): { staged: number; unstaged: number; untracked: number } | null {
 		if (!this.#gitEnabled()) return null;
-		if (this.#gitStatusInFlight || Date.now() - this.#gitStatusLastFetch < 1000) {
+
+		const gitCwd = effectiveGitCwd ?? this.#resolveActiveRepoCache().effectiveGitCwd;
+		if (this.#gitStatusInFlightCwd !== undefined) {
+			return this.#cachedGitStatusCwd === gitCwd ? this.#cachedGitStatus : null;
+		}
+		if (this.#cachedGitStatusCwd === gitCwd && Date.now() - this.#gitStatusLastFetch < 1000) {
 			return this.#cachedGitStatus;
 		}
 
-		this.#gitStatusInFlight = true;
+		this.#gitStatusInFlightCwd = gitCwd;
 
 		(async () => {
+			let nextStatus: { staged: number; unstaged: number; untracked: number } | null = null;
 			try {
-				this.#cachedGitStatus = await git.status.summary(getProjectDir());
+				nextStatus = await git.status.summary(gitCwd);
 			} catch {
-				this.#cachedGitStatus = null;
+				nextStatus = null;
 			} finally {
-				this.#gitStatusLastFetch = Date.now();
-				this.#gitStatusInFlight = false;
+				if (this.#gitStatusInFlightCwd === gitCwd) {
+					this.#cachedGitStatus = nextStatus;
+					this.#cachedGitStatusCwd = gitCwd;
+					this.#gitStatusLastFetch = Date.now();
+					this.#gitStatusInFlightCwd = undefined;
+				}
 			}
 		})();
 
-		return this.#cachedGitStatus;
+		return this.#cachedGitStatusCwd === gitCwd ? this.#cachedGitStatus : null;
 	}
 
-	#lookupPr(): { number: number; url: string } | null {
+	#lookupPr(effectiveGitCwd?: string): { number: number; url: string } | null {
 		if (!this.#gitEnabled()) return null;
 
-		const branch = this.#getCurrentBranch();
+		const gitCwd = effectiveGitCwd ?? this.#resolveActiveRepoCache().effectiveGitCwd;
+		const branch = this.#getCurrentBranch(gitCwd);
 		const currentContext = branch ? createPrCacheContext(branch, this.#cachedBranchRepoId ?? null) : null;
 
 		if (canReuseCachedPr(this.#cachedPr, this.#cachedPrContext, currentContext)) {
@@ -436,19 +638,26 @@ export class StatusLineComponent implements Component {
 
 		const stalePr = this.#cachedPr;
 
-		// Don't look up if no branch, detached HEAD, default branch, or already in flight
-		if (!branch || branch === "detached" || this.#isDefaultBranch(branch) || this.#prLookupInFlight) {
+		if (!branch) {
+			this.#cachedPr = null;
+			this.#cachedPrContext = undefined;
+			return null;
+		}
+
+		// Don't look up if detached, default branch, or already in flight.
+		if (branch === "detached" || this.#isDefaultBranch(branch, gitCwd) || this.#prLookupInFlight) {
 			return stalePr ?? null;
 		}
 
 		this.#prLookupInFlight = true;
 		const lookupContext = currentContext;
+		const lookupCwd = gitCwd;
 
 		// Fire async lookup, keep stale value visible until resolved
 		(async () => {
 			// Helper: only write cache if branch/repo context hasn't changed since launch
 			const setCachedPr = (value: { number: number; url: string } | null) => {
-				const latestBranch = this.#getCurrentBranch();
+				const latestBranch = this.#getCurrentBranch(lookupCwd);
 				const latestContext = latestBranch
 					? createPrCacheContext(latestBranch, this.#cachedBranchRepoId ?? null)
 					: undefined;
@@ -459,7 +668,8 @@ export class StatusLineComponent implements Component {
 			};
 			try {
 				// Requires `gh repo set-default` to be configured; fails gracefully if not
-				const result = await $`gh pr view --json number,url`.quiet().nothrow();
+				const result = await $`gh pr view --json number,url`.cwd(lookupCwd).quiet().nothrow();
+				if (this.#disposed) return;
 				if (result.exitCode !== 0) {
 					setCachedPr(null);
 					return;
@@ -471,10 +681,11 @@ export class StatusLineComponent implements Component {
 					setCachedPr(null);
 				}
 			} catch {
+				if (this.#disposed) return;
 				setCachedPr(null);
 			} finally {
 				this.#prLookupInFlight = false;
-				if (this.#onBranchChange) {
+				if (!this.#disposed && this.#onBranchChange) {
 					this.#onBranchChange();
 				}
 			}
@@ -513,53 +724,121 @@ export class StatusLineComponent implements Component {
 		return null;
 	}
 
+	#getUsageContextKey(session: AgentSession): string {
+		const activeProvider = session.state.model?.provider ?? session.model?.provider ?? "";
+		if (!activeProvider) return "";
+		const identity = session.modelRegistry?.authStorage?.getOAuthAccountIdentity(activeProvider, session.sessionId);
+		return [activeProvider, identity?.accountId ?? "", identity?.email ?? "", identity?.projectId ?? ""].join("\0");
+	}
+
 	/**
-	 * Background-refresh the Anthropic OAuth quota report. Guarded by a 5-min
-	 * TTL on both success (cache lifetime) and error (backoff). Exposed
-	 * (non-private) so unit tests can verify the backoff invariant.
+	 * Startup redraws only arm a short-delayed task; timeout releases the render
+	 * cadence while a late successful fetch can still refresh the cached segment.
 	 */
 	refreshUsageInBackground(): void {
 		const now = Date.now();
-		if (this.#usageInFlight) return;
-		if (this.#usageFetchedAt > 0 && now - this.#usageFetchedAt < 5 * 60_000) return;
 		const session = this.session;
-		const fetcher = (session as { fetchUsageReports?: () => Promise<unknown> }).fetchUsageReports;
+		const usageContextKey = this.#getUsageContextKey(session);
+		if (this.#cachedUsageContextKey !== usageContextKey) {
+			this.#cachedUsage = null;
+			this.#usageFetchedAt = 0;
+			this.#cachedUsageContextKey = usageContextKey;
+		}
+		if (this.#usageInFlight || this.#usageStartTimer) return;
+		if (this.#usageFetchedAt > 0 && now - this.#usageFetchedAt < 5 * 60_000) return;
+		const fetcher = (session as { fetchUsageReports?: (signal?: AbortSignal) => Promise<unknown> }).fetchUsageReports;
 		if (typeof fetcher !== "function") return;
 		this.#usageInFlight = true;
-		void fetcher
-			.call(session)
+		this.#usageStartTimer = setTimeout(() => {
+			this.#usageStartTimer = null;
+			void this.#runUsageRefresh(session, fetcher);
+		}, STATUS_USAGE_START_DELAY_MS);
+	}
+
+	async #runUsageRefresh(session: AgentSession, fetcher: (signal?: AbortSignal) => Promise<unknown>): Promise<void> {
+		if (this.#disposed || this.session !== session) {
+			this.#usageInFlight = false;
+			return;
+		}
+		const signal = AbortSignal.timeout(STATUS_USAGE_REFRESH_TIMEOUT_MS);
+		let reportsPromise: Promise<unknown> | undefined;
+		try {
+			reportsPromise = fetcher.call(session, signal);
+			this.#applyUsageRefreshReports(session, await this.#raceUsageRefreshWithSignal(reportsPromise, signal));
+		} catch {
+			if (this.session !== session) return;
+			this.#usageFetchedAt = Date.now();
+			if (signal.aborted && reportsPromise) {
+				this.#observeLateUsageRefresh(session, reportsPromise);
+			}
+		} finally {
+			if (this.session === session) this.#usageInFlight = false;
+		}
+	}
+
+	#applyUsageRefreshReports(session: AgentSession, reports: unknown): void {
+		if (this.#disposed || this.session !== session) return;
+		const activeProvider = session.state.model?.provider ?? session.model?.provider;
+		const activeIdentity =
+			activeProvider && session.modelRegistry?.authStorage
+				? session.modelRegistry.authStorage.getOAuthAccountIdentity(activeProvider, session.sessionId)
+				: undefined;
+		this.#cachedUsage = this.#normalizeUsageReports(reports, activeProvider, activeIdentity);
+		this.#usageFetchedAt = Date.now();
+	}
+
+	#observeLateUsageRefresh(session: AgentSession, reportsPromise: Promise<unknown>): void {
+		void reportsPromise
 			.then(reports => {
-				if (this.session !== session) return;
-				this.#cachedUsage = this.#normalizeUsageReports(reports);
-				this.#usageFetchedAt = Date.now();
+				this.#applyUsageRefreshReports(session, reports);
 			})
 			.catch(() => {
-				if (this.session !== session) return;
-				// Backoff on error: stamp the fetch time so the 5-min TTL guard
-				// also acts as an error budget. Without this, every render
-				// kicks off another fetch (gated only by #usageInFlight),
-				// which hammers the endpoint during a network outage / 5xx.
+				if (this.#disposed || this.session !== session) return;
 				this.#usageFetchedAt = Date.now();
-			})
-			.finally(() => {
-				if (this.session === session) this.#usageInFlight = false;
 			});
 	}
 
-	#normalizeUsageReports(reports: unknown): {
+	async #raceUsageRefreshWithSignal(promise: Promise<unknown>, signal: AbortSignal): Promise<unknown> {
+		if (signal.aborted) throw signal.reason;
+		const aborted = Promise.withResolvers<never>();
+		const onAbort = () => aborted.reject(signal.reason);
+		signal.addEventListener("abort", onAbort, { once: true });
+		try {
+			return await Promise.race([promise, aborted.promise]);
+		} finally {
+			signal.removeEventListener("abort", onAbort);
+		}
+	}
+
+	#normalizeUsageReports(
+		reports: unknown,
+		activeProvider?: string,
+		activeIdentity?: OAuthAccountIdentity,
+	): {
+		tier?: string;
 		fiveHour?: { percent: number; resetMinutes?: number };
 		sevenDay?: { percent: number; resetHours?: number };
 	} | null {
 		if (!Array.isArray(reports)) return null;
 		let fiveHour: { percent: number; resetMinutes?: number } | undefined;
 		let sevenDay: { percent: number; resetHours?: number } | undefined;
+		let fiveHourTier: string | undefined;
+		let sevenDayTier: string | undefined;
 		const now = Date.now();
 		for (const report of reports) {
 			if (!report || typeof report !== "object") continue;
+			const provider = (report as { provider?: unknown }).provider;
+			if (activeProvider && provider !== activeProvider) continue;
 			const limits = (report as { limits?: unknown }).limits;
 			if (!Array.isArray(limits)) continue;
 			for (const limit of limits) {
 				if (!limit || typeof limit !== "object") continue;
+				if (
+					activeIdentity &&
+					!limitMatchesActiveAccount(report as UsageReport, limit as UsageLimit, activeIdentity)
+				) {
+					continue;
+				}
 				const l = limit as {
 					scope?: { windowId?: string; tier?: string };
 					window?: { resetsAt?: number };
@@ -570,23 +849,30 @@ export class StatusLineComponent implements Component {
 				const windowId = l.scope?.windowId;
 				const tier = l.scope?.tier;
 				const resetsAt = l.window?.resetsAt;
-				if (windowId === "5h" && !tier && !fiveHour) {
+				// Accept tiered limits, but prefer untiered (backward compat with Anthropic).
+				// An untiered limit always replaces a tiered one; among same-tieredness, first wins.
+				if (windowId === "5h" && (!fiveHour || (fiveHourTier !== undefined && !tier))) {
 					fiveHour = {
 						percent: fraction * 100,
 						resetMinutes:
 							typeof resetsAt === "number" ? Math.max(0, Math.round((resetsAt - now) / 60_000)) : undefined,
 					};
-				} else if (windowId === "7d" && !tier && !sevenDay) {
+					fiveHourTier = tier || undefined;
+				}
+				if (windowId === "7d" && (!sevenDay || (sevenDayTier !== undefined && !tier))) {
 					sevenDay = {
 						percent: fraction * 100,
 						resetHours:
 							typeof resetsAt === "number" ? Math.max(0, Math.round((resetsAt - now) / 3_600_000)) : undefined,
 					};
+					sevenDayTier = tier || undefined;
 				}
 			}
 		}
 		if (!fiveHour && !sevenDay) return null;
-		return { fiveHour, sevenDay };
+		// Single compact label; prefer the five-hour tier if displayed windows ever disagree.
+		const effectiveTier = fiveHourTier ?? sevenDayTier;
+		return { tier: effectiveTier, fiveHour, sevenDay };
 	}
 
 	/**
@@ -649,6 +935,7 @@ export class StatusLineComponent implements Component {
 	#buildSegmentContext(
 		width: number,
 		segmentOptions: StatusLineSettings["segmentOptions"],
+		includePath: boolean,
 		includeContext: boolean,
 		includeGit: boolean,
 		includePr: boolean,
@@ -674,10 +961,12 @@ export class StatusLineComponent implements Component {
 
 		let contextWindow = state.model?.contextWindow ?? this.session.model?.contextWindow ?? 0;
 		let contextPercent: number | null = 0;
+		let contextTokens = 0;
 		if (includeContext) {
 			const breakdown = this.getCachedContextBreakdown();
+			contextTokens = breakdown.usedTokens;
 			contextWindow = breakdown.contextWindow || contextWindow;
-			contextPercent = contextWindow > 0 ? (breakdown.usedTokens / contextWindow) * 100 : 0;
+			contextPercent = contextWindow > 0 ? (breakdown.usedTokens / contextWindow) * 100 : null;
 		}
 
 		// Collab guest: context comes from the host's state frames — the local
@@ -685,28 +974,36 @@ export class StatusLineComponent implements Component {
 		const collabState = this.#collabStatus?.stateOverride;
 		if (collabState?.contextUsage) {
 			contextWindow = collabState.contextUsage.contextWindow || contextWindow;
+			contextTokens = collabState.contextUsage.tokens ?? contextTokens;
 			contextPercent = collabState.contextUsage.percent ?? contextPercent;
 		}
 
-		const gitBranch = includeGit || includePr ? this.#getCurrentBranch() : null;
-		const gitStatus = includeGit ? this.#getGitStatus() : null;
-		const gitPr = includePr ? this.#lookupPr() : null;
-
+		const shouldResolveActiveRepo = this.#gitEnabled() && (includePath || includeGit || includePr);
+		const projectDir = getProjectDir();
+		const activeRepoCache = shouldResolveActiveRepo
+			? this.#resolveActiveRepoCache()
+			: { projectDir, activeRepo: null, effectiveGitCwd: projectDir };
+		const gitBranch = includeGit || includePr ? this.#getCurrentBranch(activeRepoCache.effectiveGitCwd) : null;
+		const gitStatus = includeGit ? this.#getGitStatus(activeRepoCache.effectiveGitCwd) : null;
+		const gitPr = includePr ? this.#lookupPr(activeRepoCache.effectiveGitCwd) : null;
 		return {
 			session: this.session,
 			focusedAgentId: this.#focusedAgentId,
+			activeRepo: activeRepoCache.activeRepo,
 			width,
 			options: segmentOptions ?? {},
+			compactThinkingLevel: this.#resolveSettings().compactThinkingLevel ?? false,
 			planMode: this.#planModeStatus,
 			loopMode: this.#loopModeStatus,
 			goalMode: this.#goalModeStatus,
 			collab: this.#collabStatus,
 			usageStats,
 			contextPercent,
+			contextTokens,
 			contextWindow,
 			autoCompactEnabled: this.#autoCompactEnabled,
 			subagentCount: this.#subagentCount,
-			sessionStartTime: this.#sessionStartTime,
+			activeMs: this.getActiveMs(),
 			git: {
 				branch: gitBranch,
 				status: gitStatus,
@@ -757,8 +1054,16 @@ export class StatusLineComponent implements Component {
 		};
 	}
 
+	#subagentBadgeText(): string | undefined {
+		if (this.#subagentCount === 0) return undefined;
+		const noun = this.#subagentCount === 1 ? "agent" : "agents";
+		return theme.fg("statusLineSubagents", `${theme.icon.agents} ${this.#subagentCount} ${noun}`);
+	}
+
 	#buildStatusLine(width: number): string {
 		const effectiveSettings = this.#resolveSettings();
+		const includePath =
+			hasPathSegment(effectiveSettings.leftSegments) || hasPathSegment(effectiveSettings.rightSegments);
 		const includeContext =
 			hasContextSegment(effectiveSettings.leftSegments) || hasContextSegment(effectiveSettings.rightSegments);
 		const gitEnabled = this.#gitEnabled();
@@ -770,6 +1075,7 @@ export class StatusLineComponent implements Component {
 		const ctx = this.#buildSegmentContext(
 			width,
 			effectiveSettings.segmentOptions,
+			includePath,
 			includeContext,
 			includeGit,
 			includePr,
@@ -787,11 +1093,13 @@ export class StatusLineComponent implements Component {
 		const transparentBg = bgAnsi === TRANSPARENT_BG_ANSI;
 		const fgAnsi = theme.getFgAnsi("text");
 		const sepAnsi = theme.getFgAnsi("statusLineSep");
+		const subagentBadge = this.#subagentBadgeText();
 
 		// Collect visible segment contents
 		const leftParts: string[] = [];
 		const leftSegIds: StatusLineSegmentId[] = [];
 		for (const segId of effectiveSettings.leftSegments) {
+			if (subagentBadge && segId === "subagents") continue;
 			const rendered = renderSegment(segId, ctx);
 			if (rendered.visible && rendered.content) {
 				leftParts.push(rendered.content);
@@ -801,6 +1109,7 @@ export class StatusLineComponent implements Component {
 
 		const rightParts: string[] = [];
 		for (const segId of effectiveSettings.rightSegments) {
+			if (subagentBadge && segId === "subagents") continue;
 			const rendered = renderSegment(segId, ctx);
 			if (rendered.visible && rendered.content) {
 				rightParts.push(rendered.content);
@@ -810,6 +1119,9 @@ export class StatusLineComponent implements Component {
 		const runningBackgroundJobs = this.session.getAsyncJobSnapshot()?.running.length ?? 0;
 		if (runningBackgroundJobs > 0) {
 			rightParts.unshift(theme.fg("statusLineSubagents", `${theme.icon.job} ${runningBackgroundJobs}`));
+		}
+		if (subagentBadge) {
+			rightParts.unshift(subagentBadge);
 		}
 		const topFillWidth = Math.max(0, width);
 		const left = [...leftParts];

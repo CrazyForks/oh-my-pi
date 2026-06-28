@@ -22,7 +22,7 @@ import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { z } from "zod/v4";
+import { type } from "arktype";
 
 // ---------------------------------------------------------------------------
 // Shared setup
@@ -37,7 +37,7 @@ function makeFakeTool(name: string): AgentTool & { executeCalls: number } {
 		name,
 		label: name,
 		description: `Fake ${name}`,
-		parameters: z.object({ command: z.string().optional() }),
+		parameters: type({ "command?": "string" }),
 		executeCalls: 0,
 		async execute() {
 			tool.executeCalls++;
@@ -784,4 +784,14 @@ it("read tool: requestPermission is never called for non-gated tools", async () 
 
 	expect(permissionSpy).toHaveBeenCalledTimes(0);
 	expect(readTool.executeCalls).toBe(1);
+});
+
+it("setActiveToolsByName normalizes legacy tool names", async () => {
+	const grepTool = makeFakeTool("grep");
+	const globTool = makeFakeTool("glob");
+	session = await createSession([grepTool, globTool]);
+
+	await session.setActiveToolsByName(["Search", "find", "grep"]);
+
+	expect(session.getActiveToolNames()).toEqual(["grep", "glob"]);
 });

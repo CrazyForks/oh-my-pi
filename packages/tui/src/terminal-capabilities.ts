@@ -1,5 +1,6 @@
 import { encodeSixel } from "@oh-my-pi/pi-natives";
 import { $env, isBunTestRuntime, isTerminalHeadless } from "@oh-my-pi/pi-utils";
+import { sendDesktopNotification, shouldDeliverDesktopNotification } from "./desktop-notify";
 import {
 	detectKittyUnicodePlaceholdersSupport,
 	getKittyGraphics,
@@ -21,7 +22,16 @@ export enum NotifyProtocol {
 	Osc9 = "\x1b]9;",
 }
 
-export type TerminalId = "kitty" | "ghostty" | "wezterm" | "iterm2" | "vscode" | "alacritty" | "base" | "trueColor";
+export type TerminalId =
+	| "kitty"
+	| "ghostty"
+	| "wezterm"
+	| "iterm2"
+	| "vscode"
+	| "alacritty"
+	| "warp"
+	| "base"
+	| "trueColor";
 
 function hasNeedleBefore(line: string, needle: string, limit: number): boolean {
 	const index = line.indexOf(needle);
@@ -98,8 +108,56 @@ export class TerminalInfo {
 
 	sendNotification(message: string | TerminalNotification): void {
 		if (isNotificationSuppressed() || isTerminalHeadless()) return;
-		process.stdout.write(this.formatNotification(message));
+		const formatted = this.formatNotification(message);
+		// Under tmux, terminals whose notify protocol is OSC 9 / OSC 99 would
+		// otherwise lose the notification entirely: tmux does not forward bare
+		// OSC 9/99 to the outer terminal, and the bare sequence does not flag
+		// tmux's own `monitor-bell` / `monitor-activity`. Wrap the OSC in tmux's
+		// DCS passthrough envelope so users with `allow-passthrough on` still
+		// get the desktop toast, then append a BEL so `monitor-bell` flags the
+		// pane/window for everyone else — the only signal a backgrounded pane
+		// has that the agent finished or is waiting for input. `Bell` protocol
+		// already self-flags via tmux's bell monitoring, so leave it alone.
+		if (this.notifyProtocol !== NotifyProtocol.Bell && isInsideTmux()) {
+			process.stdout.write(`${wrapTmuxPassthrough(formatted)}\x07`);
+			return;
+		}
+		process.stdout.write(formatted);
+		// VTE-family terminals (Ptyxis, GNOME Terminal, Tilix, …) plus Alacritty
+		// and bare xterm-on-Wayland have no in-band escape that surfaces an
+		// arbitrary desktop toast (#3685). When the chosen `notifyProtocol` is
+		// BEL on a Linux session bus, also fan the notification out via
+		// libnotify so users see the toast and the BEL still fires for tmux
+		// `monitor-bell` / X11 urgency hints / audible bell.
+		if (this.notifyProtocol === NotifyProtocol.Bell && shouldDeliverDesktopNotification(this.id, true)) {
+			sendDesktopNotification(message);
+		}
 	}
+}
+
+/**
+ * Whether the agent process is running inside a tmux session. Read fresh on
+ * each call so tests can toggle `Bun.env.TMUX` per case without re-importing
+ * the module and so a tmux session attached/detached mid-run is observed.
+ */
+export function isInsideTmux(env: NodeJS.ProcessEnv = Bun.env): boolean {
+	return Boolean(env.TMUX);
+}
+
+/**
+ * Wrap a control-sequence payload in tmux's DCS passthrough envelope. Each
+ * ESC byte inside `payload` is doubled per tmux's escape rules. tmux strips
+ * the envelope and forwards the unwrapped payload to the outer terminal only
+ * when the user opts in with `set -g allow-passthrough on`; otherwise tmux
+ * silently consumes the envelope, which is identical to the pre-wrap baseline
+ * (tmux already swallowed the bare OSC).
+ *
+ * Used by `TerminalInfo.sendNotification` and the OSC 99 capability probe in
+ * `terminal.ts` to keep notifications alive for terminals that understand
+ * OSC 9 / OSC 99 (kitty, ghostty, wezterm, iterm2) when running under tmux.
+ */
+export function wrapTmuxPassthrough(payload: string): string {
+	return `\x1bPtmux;${payload.replaceAll("\x1b", "\x1b\x1b")}\x1b\\`;
 }
 
 export function isNotificationSuppressed(): boolean {
@@ -212,9 +270,9 @@ export function shouldEnableSynchronizedOutputByDefault(
 		case "vscode":
 			return true;
 		default:
-			// VTE family, GNU screen, Apple Terminal, legacy native console host
-			// (no WT_SESSION), and bare/unknown xterm profiles stay off until the
-			// DECRQM probe proves support.
+			// VTE family, GNU screen, Apple Terminal, Warp, legacy native console
+			// host (no WT_SESSION), and bare/unknown xterm profiles stay off until
+			// the DECRQM probe proves support.
 			return false;
 	}
 }
@@ -335,6 +393,24 @@ function getFallbackImageProtocol(terminalId: TerminalId): ImageProtocol | null 
 	}
 	return null;
 }
+/**
+ * Warp implements the Kitty graphics protocol only on macOS/Linux; its Windows
+ * build (including Warp-hosted WSL shells) renders the same APC sequences as
+ * visible garbage. Keep platform/env injectable so the carve-out is testable
+ * without mutating `process.platform`.
+ */
+export function resolveWarpImageProtocol(
+	platform: NodeJS.Platform = process.platform,
+	env: NodeJS.ProcessEnv = Bun.env,
+): ImageProtocol | null {
+	const windowsHost =
+		platform === "win32" || (platform === "linux" && Boolean(env.WSL_DISTRO_NAME || env.WSL_INTEROP));
+	return windowsHost ? null : ImageProtocol.Kitty;
+}
+
+function getWarpTerminalInfo(platform: NodeJS.Platform, env: NodeJS.ProcessEnv = Bun.env): TerminalInfo {
+	return new TerminalInfo("warp", resolveWarpImageProtocol(platform, env), true, false, NotifyProtocol.Osc9);
+}
 const KNOWN_TERMINALS = Object.freeze({
 	// Fallback terminals
 	base: new TerminalInfo("base", null, false, false, NotifyProtocol.Bell),
@@ -346,9 +422,16 @@ const KNOWN_TERMINALS = Object.freeze({
 	iterm2: new TerminalInfo("iterm2", ImageProtocol.Iterm2, true, true, NotifyProtocol.Osc9),
 	vscode: new TerminalInfo("vscode", null, true, true, NotifyProtocol.Bell),
 	alacritty: new TerminalInfo("alacritty", null, true, true, NotifyProtocol.Bell),
+	// Warp identifies via TERM_PROGRAM=WarpTerminal and ships the Kitty graphics
+	// protocol on macOS/Linux (direct placement only — no Unicode placeholders, so
+	// detectKittyUnicodePlaceholdersSupport correctly excludes it). It does not
+	// honor OSC 8 yet (the escape renders as visible text), so hyperlinks stay off,
+	// but it does support OSC 9 notifications.
+	warp: new TerminalInfo("warp", ImageProtocol.Kitty, true, false, NotifyProtocol.Osc9),
 });
 
-export const TERMINAL_ID: TerminalId = (() => {
+/** Resolve terminal identity from environment markers used by common emulators. */
+export function detectTerminalId(env: NodeJS.ProcessEnv = Bun.env): TerminalId {
 	function caseEq(a: string, b: string): boolean {
 		return a.toLowerCase() === b.toLowerCase(); // For compiler to pattern match
 	}
@@ -363,7 +446,7 @@ export const TERMINAL_ID: TerminalId = (() => {
 		TERM_PROGRAM,
 		TERM,
 		COLORTERM,
-	} = Bun.env;
+	} = env;
 
 	if (KITTY_WINDOW_ID) return "kitty";
 	if (GHOSTTY_RESOURCES_DIR) return "ghostty";
@@ -379,6 +462,7 @@ export const TERMINAL_ID: TerminalId = (() => {
 		if (caseEq(TERM_PROGRAM, "iterm.app")) return "iterm2";
 		if (caseEq(TERM_PROGRAM, "vscode")) return "vscode";
 		if (caseEq(TERM_PROGRAM, "alacritty")) return "alacritty";
+		if (caseEq(TERM_PROGRAM, "warpterminal")) return "warp";
 	}
 
 	if (TERM?.toLowerCase().includes("ghostty")) return "ghostty";
@@ -387,7 +471,9 @@ export const TERMINAL_ID: TerminalId = (() => {
 		if (caseEq(COLORTERM, "truecolor") || caseEq(COLORTERM, "24bit")) return "trueColor";
 	}
 	return "base";
-})();
+}
+
+export const TERMINAL_ID: TerminalId = detectTerminalId(Bun.env);
 
 /**
  * The process-wide {@link TERMINAL} singleton: a {@link TerminalInfo} whose
@@ -409,6 +495,9 @@ export const TERMINAL: RuntimeTerminal = (() => {
 	const forcedImageProtocol = getForcedImageProtocol();
 	if (forcedImageProtocol !== undefined) {
 		resolved.imageProtocol = forcedImageProtocol;
+	} else if (resolved.id === "warp") {
+		// Warp advertises Kitty graphics on macOS/Linux only; drop it on win32.
+		resolved.imageProtocol = resolveWarpImageProtocol();
 	} else if (!resolved.imageProtocol) {
 		const fallbackImageProtocol = getFallbackImageProtocol(resolved.id);
 		if (fallbackImageProtocol) resolved.imageProtocol = fallbackImageProtocol;
@@ -465,8 +554,12 @@ export function setTerminalTextSizing(enabled: boolean): void {
 	TERMINAL.textSizing = enabled;
 }
 
-export function getTerminalInfo(terminalId: TerminalId): TerminalInfo {
-	return KNOWN_TERMINALS[terminalId];
+export function getTerminalInfo(
+	terminalId: TerminalId,
+	platform: NodeJS.Platform = process.platform,
+	env: NodeJS.ProcessEnv = Bun.env,
+): TerminalInfo {
+	return terminalId === "warp" ? getWarpTerminalInfo(platform, env) : KNOWN_TERMINALS[terminalId];
 }
 
 export interface CellDimensions {

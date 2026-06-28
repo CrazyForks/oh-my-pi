@@ -270,37 +270,67 @@ interface SessionListHeader {
 	timestamp?: string;
 }
 
+function normalizeTitleOverride(title: string | undefined): string | null | undefined {
+	if (title === undefined) return undefined;
+	return title.trim() ? title : null;
+}
+
+function sessionListHeaderFromRecord(
+	record: Record<string, unknown> | undefined,
+	titleOverride?: string | null,
+): SessionListHeader | undefined {
+	if (record?.type !== "session" || typeof record.id !== "string") return undefined;
+	return {
+		type: "session",
+		id: record.id,
+		cwd: typeof record.cwd === "string" ? record.cwd : undefined,
+		title:
+			titleOverride === null
+				? undefined
+				: (titleOverride ?? (typeof record.title === "string" ? record.title : undefined)),
+		parentSession: typeof record.parentSession === "string" ? record.parentSession : undefined,
+		timestamp: typeof record.timestamp === "string" ? record.timestamp : undefined,
+	};
+}
+
+function parseSessionListHeaderLine(line: string, titleOverride?: string | null): SessionListHeader | undefined {
+	if (extractStringProperty(line, "type") !== "session") return undefined;
+	const id = extractStringProperty(line, "id");
+	if (!id) return undefined;
+	return {
+		type: "session",
+		id,
+		cwd: extractStringProperty(line, "cwd"),
+		title: titleOverride === null ? undefined : (titleOverride ?? extractStringProperty(line, "title")),
+		parentSession: extractStringProperty(line, "parentSession"),
+		timestamp: extractStringProperty(line, "timestamp"),
+	};
+}
+
 function parseSessionListHeader(
 	content: string,
 	entries: Array<Record<string, unknown>>,
 ): SessionListHeader | undefined {
-	const parsedHeader = entries[0];
-	if (parsedHeader?.type === "session" && typeof parsedHeader.id === "string") {
-		return {
-			type: "session",
-			id: parsedHeader.id,
-			cwd: typeof parsedHeader.cwd === "string" ? parsedHeader.cwd : undefined,
-			title: typeof parsedHeader.title === "string" ? parsedHeader.title : undefined,
-			parentSession: typeof parsedHeader.parentSession === "string" ? parsedHeader.parentSession : undefined,
-			timestamp: typeof parsedHeader.timestamp === "string" ? parsedHeader.timestamp : undefined,
-		};
+	const firstEntry = entries[0];
+	const parsedSlotTitle = normalizeTitleOverride(
+		firstEntry?.type === "title" && typeof firstEntry.title === "string" ? firstEntry.title : undefined,
+	);
+	const parsedHeader = sessionListHeaderFromRecord(entries[firstEntry?.type === "title" ? 1 : 0], parsedSlotTitle);
+	if (parsedHeader) return parsedHeader;
+
+	let slotTitle: string | null | undefined;
+	let firstNonEmpty = true;
+	for (const rawLine of content.split(/\r?\n/)) {
+		const line = rawLine.trim();
+		if (!line) continue;
+		if (firstNonEmpty && extractStringProperty(line, "type") === "title") {
+			slotTitle = normalizeTitleOverride(extractStringProperty(line, "title"));
+			firstNonEmpty = false;
+			continue;
+		}
+		return parseSessionListHeaderLine(line, slotTitle);
 	}
-
-	const firstLineEnd = content.indexOf("\n");
-	const firstLine = firstLineEnd === -1 ? content : content.slice(0, firstLineEnd);
-	if (extractStringProperty(firstLine, "type") !== "session") return undefined;
-
-	const id = extractStringProperty(firstLine, "id");
-	if (!id) return undefined;
-
-	return {
-		type: "session",
-		id,
-		cwd: extractStringProperty(firstLine, "cwd"),
-		title: extractStringProperty(firstLine, "title"),
-		parentSession: extractStringProperty(firstLine, "parentSession"),
-		timestamp: extractStringProperty(firstLine, "timestamp"),
-	};
+	return undefined;
 }
 
 function getSessionListWorkerCount(fileCount: number): number {
@@ -495,12 +525,32 @@ async function scanSessionDir(
 	}
 }
 
+async function scanSessionDirReadOnly(
+	sessionDir: string,
+	storage: SessionStorage,
+	withStatus: boolean,
+): Promise<SessionInfo[]> {
+	try {
+		const files = storage.listFilesSync(sessionDir, "*.jsonl");
+		return await collectSessionsFromFiles(files, storage, withStatus);
+	} catch {
+		return [];
+	}
+}
+
 /**
  * List sessions in a resolved session directory (newest first), reading each
  * file's lifecycle {@link SessionStatus}.
  */
 export function listSessions(sessionDir: string, storage: SessionStorage): Promise<SessionInfo[]> {
 	return scanSessionDir(sessionDir, storage, true);
+}
+
+/**
+ * List sessions without repairing orphaned backups or mutating the directory.
+ */
+export function listSessionsReadOnly(sessionDir: string, storage: SessionStorage): Promise<SessionInfo[]> {
+	return scanSessionDirReadOnly(sessionDir, storage, true);
 }
 
 /** List all sessions across all project directories (newest first). */
@@ -561,12 +611,25 @@ function sessionMatchesResumeArg(session: SessionInfo, sessionArg: string): bool
 	return fileSessionId.startsWith(normalizedArg);
 }
 
+/** Controls cross-directory fallback for resumable session lookup. */
+export interface ResolveResumableSessionOptions {
+	/** Search default global session buckets after the active/custom session directory misses. */
+	allowGlobalFallback?: boolean;
+}
+
+function isSessionStorage(value: SessionStorage | ResolveResumableSessionOptions): value is SessionStorage {
+	return "listFilesSync" in value;
+}
+
 export async function resolveResumableSession(
 	sessionArg: string,
 	cwd: string,
 	sessionDir?: string,
-	storage: SessionStorage = new FileSessionStorage(),
+	storageOrOptions: SessionStorage | ResolveResumableSessionOptions = new FileSessionStorage(),
+	options: ResolveResumableSessionOptions = {},
 ): Promise<ResolvedSessionMatch | undefined> {
+	const storage = isSessionStorage(storageOrOptions) ? storageOrOptions : new FileSessionStorage();
+	const resolvedOptions = isSessionStorage(storageOrOptions) ? options : storageOrOptions;
 	const localSessionDir = sessionDir ?? computeDefaultSessionDir(cwd, storage);
 	const localSessions = await listSessions(localSessionDir, storage);
 	const localMatch = localSessions.find(session => sessionMatchesResumeArg(session, sessionArg));
@@ -574,7 +637,7 @@ export async function resolveResumableSession(
 		return { session: localMatch, scope: "local" };
 	}
 
-	if (sessionDir) {
+	if (sessionDir && resolvedOptions.allowGlobalFallback !== true) {
 		return undefined;
 	}
 

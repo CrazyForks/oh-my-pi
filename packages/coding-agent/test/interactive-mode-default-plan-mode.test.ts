@@ -8,7 +8,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import * as z from "zod/v4";
+import { type } from "arktype";
 import { ModelRegistry } from "../src/config/model-registry";
 import { InteractiveMode } from "../src/modes/interactive-mode";
 
@@ -17,11 +17,16 @@ function makeTool(name: string): AgentTool {
 		name,
 		label: name,
 		description: `Fake ${name}`,
-		parameters: z.object({}),
+		parameters: type({}),
 		async execute() {
 			return { content: [{ type: "text" as const, text: "ok" }] };
 		},
 	};
+}
+
+interface HarnessOptions {
+	extraRegistryTools?: readonly AgentTool[];
+	builtInToolNames?: Iterable<string>;
 }
 
 describe("InteractiveMode plan.defaultOnStartup", () => {
@@ -35,7 +40,6 @@ describe("InteractiveMode plan.defaultOnStartup", () => {
 	});
 
 	beforeEach(async () => {
-		Bun.gc(true);
 		resetSettingsForTest();
 		tempDir = TempDir.createSync("@pi-default-plan-");
 		await Settings.init({ inMemory: true, cwd: tempDir.path() });
@@ -55,7 +59,6 @@ describe("InteractiveMode plan.defaultOnStartup", () => {
 		authStorage = undefined as unknown as AuthStorage;
 		tempDir = undefined as unknown as TempDir;
 		resetSettingsForTest();
-		Bun.gc(true);
 	});
 
 	function modelOrThrow(registry: ModelRegistry, id: string): Model<Api> {
@@ -64,8 +67,12 @@ describe("InteractiveMode plan.defaultOnStartup", () => {
 		return model;
 	}
 
-	/** Build an InteractiveMode over a brand-new (never-persisted) session. */
-	function createHarness(settings: Settings): InteractiveMode {
+	/** Build an InteractiveMode over a brand-new (never-persisted) session.
+	 *  `extraRegistryTools` registers additional tools that are NOT initially
+	 *  active — modeling tools hidden by `tools.discoveryMode === "all"` that
+	 *  modes may force-activate on entry. `builtInToolNames` marks which registry
+	 *  entries still have built-in provenance after extension shadowing. */
+	function createHarness(settings: Settings, options: HarnessOptions = {}): InteractiveMode {
 		const registry = new ModelRegistry(authStorage, path.join(tempDir.path(), `models-${Bun.nanoseconds()}.yml`));
 		const initialModel = modelOrThrow(registry, "claude-sonnet-4-5");
 		const readTool = makeTool("read");
@@ -76,6 +83,9 @@ describe("InteractiveMode plan.defaultOnStartup", () => {
 			[readTool.name, readTool],
 			[resolveTool.name, resolveTool],
 		]);
+		for (const tool of options.extraRegistryTools ?? []) {
+			toolRegistry.set(tool.name, tool);
+		}
 		const manager = SessionManager.create(tempDir.path(), path.join(tempDir.path(), `active-${Bun.nanoseconds()}`));
 		const createdSession = new AgentSession({
 			agent: new Agent({
@@ -91,6 +101,7 @@ describe("InteractiveMode plan.defaultOnStartup", () => {
 			settings,
 			modelRegistry: registry,
 			toolRegistry,
+			builtInToolNames: options.builtInToolNames ?? ["read", "resolve"],
 		});
 		session = createdSession;
 		mode = new InteractiveMode(createdSession, "test");
@@ -105,6 +116,40 @@ describe("InteractiveMode plan.defaultOnStartup", () => {
 		expect(created.planModeEnabled).toBe(true);
 		expect(session?.getPlanModeState()).toMatchObject({ enabled: true, planFilePath: "local://PLAN.md" });
 		expect(session?.getActiveToolNames()).toContain("resolve");
+	});
+
+	it("activates write when entering plan mode even if it was hidden by discoveryMode (issue #3165)", async () => {
+		// `plan-mode-active.md` instructs the agent to draft the plan file with
+		// `write` and refine it with `edit`. Under `tools.discoveryMode === "all"`
+		// `write` is hidden behind `search_tool_bm25` so it's in the registry but
+		// not the initial active set. Plan-mode entry must force-activate it or
+		// the agent only has `edit`, which fails on a non-existent file.
+		const writeTool = makeTool("write");
+		const created = createHarness(Settings.isolated({ "plan.defaultOnStartup": true, "compaction.enabled": false }), {
+			extraRegistryTools: [writeTool],
+			builtInToolNames: ["read", "resolve", "write"],
+		});
+
+		expect(session?.getActiveToolNames()).not.toContain("write");
+
+		await created.init({ suppressWelcomeIntro: true });
+
+		expect(created.planModeEnabled).toBe(true);
+		expect(session?.getActiveToolNames()).toContain("write");
+		expect(session?.getActiveToolNames()).toContain("resolve");
+	});
+
+	it("does not activate an extension-shadowed write tool in plan mode", async () => {
+		const shadowWriteTool = makeTool("write");
+		const created = createHarness(Settings.isolated({ "plan.defaultOnStartup": true, "compaction.enabled": false }), {
+			extraRegistryTools: [shadowWriteTool],
+		});
+
+		await created.init({ suppressWelcomeIntro: true });
+
+		expect(created.planModeEnabled).toBe(true);
+		expect(session?.getActiveToolNames()).toContain("resolve");
+		expect(session?.getActiveToolNames()).not.toContain("write");
 	});
 
 	it("does not enter plan mode at startup by default", async () => {

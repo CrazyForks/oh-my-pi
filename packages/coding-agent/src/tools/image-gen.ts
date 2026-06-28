@@ -1,6 +1,7 @@
 import * as os from "node:os";
 import * as path from "node:path";
-import { type ApiKey, type FetchImpl, getEnvApiKey, type Model, ProviderHttpError, withAuth } from "@oh-my-pi/pi-ai";
+import { type ApiKey, type FetchImpl, getEnvApiKey, type Model, withAuth } from "@oh-my-pi/pi-ai";
+import { ProviderHttpError } from "@oh-my-pi/pi-ai/error";
 import {
 	CODEX_BASE_URL,
 	getCodexAccountId,
@@ -19,7 +20,7 @@ import {
 	Snowflake,
 	untilAborted,
 } from "@oh-my-pi/pi-utils";
-import { z } from "zod/v4";
+import { type } from "arktype";
 import packageJson from "../../package.json" with { type: "json" };
 import { isAuthenticated, type ModelRegistry } from "../config/model-registry";
 import { settings } from "../config/settings";
@@ -58,37 +59,32 @@ const XAI_IMAGE_ASPECT_RATIOS = [...COMMON_IMAGE_ASPECT_RATIOS, "3:2", "2:3"] as
 const COMMON_IMAGE_ASPECT_RATIO_SET = new Set<string>(COMMON_IMAGE_ASPECT_RATIOS);
 const IMAGE_PROVIDER_PREFERENCES = new Set<string>(["auto", "antigravity", "gemini", "openai", "openrouter", "xai"]);
 
-const responseModalitySchema = z.enum(["IMAGE", "TEXT"] as const);
-const aspectRatioSchema = z.enum(XAI_IMAGE_ASPECT_RATIOS).describe("aspect ratio");
-const imageSizeSchema = z.enum(["1024x1024", "1536x1024", "1024x1536"] as const).describe("image size");
+const responseModalitySchema = type('"IMAGE" | "TEXT"');
 
-const inputImageSchema = z
-	.object({
-		path: z.string().describe("input image path").optional(),
-		data: z.string().describe("base64 image data").optional(),
-		mime_type: z.string().describe("mime type").optional(),
-	})
-	.strict();
+const aspectRatioSchema = type.enumerated(...XAI_IMAGE_ASPECT_RATIOS).describe("aspect ratio");
+const imageSizeSchema = type('"1024x1024" | "1536x1024" | "1024x1536"').describe("image size");
 
-const baseImageSchema = z
-	.object({
-		subject: z.string().describe("main subject"),
-		action: z.string().describe("what subject is doing").optional(),
-		scene: z.string().describe("location or environment").optional(),
-		composition: z.string().describe("camera angle and framing").optional(),
-		lighting: z.string().describe("lighting setup").optional(),
-		style: z.string().describe("artistic style").optional(),
-		text: z.string().describe("text to render").optional(),
-		changes: z.array(z.string()).describe("edits to make").optional(),
-		aspect_ratio: aspectRatioSchema.optional(),
-		image_size: imageSizeSchema.optional(),
-		input: z.array(inputImageSchema).describe("input images").optional(),
-	})
-	.strict();
+const inputImageSchema = type({
+	"path?": type("string").describe("input image path"),
+	"data?": type("string").describe("base64 image data"),
+	"mime_type?": type("string").describe("mime type"),
+});
 
-export const imageGenSchema = baseImageSchema;
-export type ImageGenParams = z.infer<typeof imageGenSchema>;
-export type GeminiResponseModality = z.infer<typeof responseModalitySchema>;
+export const imageGenSchema = type({
+	subject: type("string").describe("main subject"),
+	"action?": type("string").describe("what subject is doing"),
+	"scene?": type("string").describe("location or environment"),
+	"composition?": type("string").describe("camera angle and framing"),
+	"lighting?": type("string").describe("lighting setup"),
+	"style?": type("string").describe("artistic style"),
+	"text?": type("string").describe("text to render"),
+	"changes?": type("string[]").describe("edits to make"),
+	"aspect_ratio?": aspectRatioSchema,
+	"image_size?": imageSizeSchema,
+	"input?": inputImageSchema.array().describe("input images"),
+});
+export type ImageGenParams = typeof imageGenSchema.infer;
+export type GeminiResponseModality = typeof responseModalitySchema.infer;
 
 /**
  * Assembles a structured prompt from the provided parameters.
@@ -1577,19 +1573,15 @@ export const imageGenTool: CustomTool<typeof imageGenSchema, ImageGenToolDetails
 };
 
 export async function getImageGenTools(
-	modelRegistry?: ModelRegistry,
-	activeModel?: Model,
+	_modelRegistry?: ModelRegistry,
+	_activeModel?: Model,
 ): Promise<Array<CustomTool<typeof imageGenSchema, ImageGenToolDetails>>> {
-	const apiKey = await findImageApiKey(modelRegistry, activeModel);
-	if (!apiKey) return [];
 	return [imageGenTool];
 }
 
 export async function getImageGenToolsWithRegistry(
-	modelRegistry: ModelRegistry,
-	activeModel?: Model,
+	_modelRegistry: ModelRegistry,
+	_activeModel?: Model,
 ): Promise<Array<CustomTool<typeof imageGenSchema, ImageGenToolDetails>>> {
-	const apiKey = await findImageApiKey(modelRegistry, activeModel);
-	if (!apiKey) return [];
 	return [imageGenTool];
 }

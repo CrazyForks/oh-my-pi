@@ -8,8 +8,8 @@
 //    input on the stored content block and drop the transient `partialJson`
 //    accumulation buffer, mirroring the function_call branch.
 import { describe, expect, test } from "bun:test";
-import { processResponsesStream } from "@oh-my-pi/pi-ai/providers/openai-responses-shared";
 import type { ResponseStreamEvent } from "@oh-my-pi/pi-ai/providers/openai-responses-wire";
+import { processResponsesStream } from "@oh-my-pi/pi-ai/providers/openai-shared";
 import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 
@@ -161,7 +161,7 @@ describe("processResponsesStream: terminal events", () => {
 		if (block?.type !== "toolCall") throw new Error("expected a toolCall block");
 		expect(block.customWireName).toBe("apply_patch");
 		expect(block.arguments).toEqual({ input: patch });
-		expect("partialJson" in block).toBe(false);
+		expect((block as unknown as Record<string, unknown>).partialJson).toBeUndefined();
 
 		const end = emitted.find(e => e.type === "toolcall_end") as
 			| { toolCall: { arguments: Record<string, unknown> } }

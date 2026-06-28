@@ -161,6 +161,7 @@ export async function fetchWithRetry(
 		defaultDelayMs,
 		prepareInit,
 		fetch: fetchImpl = fetch,
+		timeout = false,
 		...baseInit
 	} = options;
 	const signal = baseInit.signal as AbortSignal | undefined;
@@ -168,7 +169,18 @@ export async function fetchWithRetry(
 	for (let attempt = 0; ; attempt++) {
 		if (signal?.aborted) throw new Error("Request was aborted");
 		const requestUrl = typeof url === "function" ? url(attempt) : url;
-		const init = prepareInit ? mergeInit(baseInit, await prepareInit(attempt)) : baseInit;
+		// `timeout` is destructured out of `baseInit`, so forward it to the underlying
+		// fetch on the no-`prepareInit` path too. Without this, callers that pass
+		// `timeout: false` (every streaming provider, to disable Bun's native ~300s
+		// fetch ceiling in favor of their own first-event/idle watchdog) had it
+		// silently dropped, so long-running streams were killed at ~300s (issue #602).
+		// Only forward when the caller actually set `timeout`, so callers that never
+		// set it keep Bun's default ceiling.
+		const init = prepareInit
+			? mergeInit(baseInit, await prepareInit(attempt), timeout)
+			: "timeout" in options
+				? ({ ...baseInit, timeout } as unknown as RequestInit)
+				: baseInit;
 
 		let response: Response;
 		try {
@@ -192,8 +204,8 @@ export async function fetchWithRetry(
 	}
 }
 
-function mergeInit(base: RequestInit, overlay: RequestInit): RequestInit {
-	const merged: RequestInit = { ...base, ...overlay };
+function mergeInit(base: RequestInit, overlay: RequestInit, timeout: number | false): RequestInit {
+	const merged = { ...base, ...overlay, timeout } as unknown as RequestInit;
 	if (base.headers || overlay.headers) {
 		const baseHeaders = new Headers(base.headers ?? undefined);
 		const overlayHeaders = new Headers(overlay.headers ?? undefined);

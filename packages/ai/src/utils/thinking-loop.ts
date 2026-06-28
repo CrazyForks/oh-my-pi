@@ -10,13 +10,11 @@
  *
  * This guard watches the streamed `thinking` deltas and, on a match, terminates
  * the stream with a synthetic `error` {@link AssistantMessage} that carries
- * **no observable content**. An empty-content `stopReason: "error"` whose
- * message hits the transient-transport pattern is what `AgentSession`
- * classifies as a *retryable* stop (a contentful error stop is treated as
- * replay-unsafe and is never retried), so the turn is discarded and re-sampled
- * instead of committing the garbage transcript.
+ * **no observable content**. An empty-content `stopReason: "error"` message tagged
+ * with `AIError.Flag.ThinkingLoop` lets result consumers and `AgentSession` discard
+ * the runaway and re-sample instead of committing garbage transcript.
  *
- * Two failure shapes are detected:
+ * Three failure shapes are detected:
  * 1. **Verbatim tail repetition** — a short unit repeated back-to-back (e.g.
  *    "🌊 🌊 🌊 …"). Caught from a rolling 250-char tail.
  * 2. **Near-duplicate segments** — paragraphs that normalize to the same
@@ -24,16 +22,23 @@
  *    paragraphs. Thresholds were calibrated on a real loop transcript plus
  *    13.5k non-loop thinking blocks (zero false positives; hardest negative
  *    scored 3 against the trigger of 4).
+ * 3. **Progress-lexicon stall** — paragraphs that keep reshuffling the same
+ *    motivational filler ("just doing it, pushing ahead, maintaining momentum")
+ *    into fresh word order, so trigrams never match, yet introduce no new
+ *    vocabulary and name nothing concrete. Caught by a run of low-novelty,
+ *    anchor-free segments; a segment naming a path/identifier resets the run, so
+ *    genuine but vocabulary-repetitive work (per-file templates) is spared.
  *
- * Scope is deliberately narrow: **thinking only**. Answer text is left
- * untouched so the guard can never discard already-streamed visible output. The
- * guard is gated to Gemini models and wraps the provider stream, so it works
- * across every Gemini transport (OpenRouter `openai-completions`, direct
- * `google-generative-ai` / `google-gemini-cli`, Vertex). Disable with
- * `PI_NO_THINKING_LOOP_GUARD=1`.
+ * Scope is narrow: guarded Gemini/DeepSeek streams before any tool call. Native
+ * thinking is checked first; assistant text can also be checked for providers
+ * that surface reasoning as visible prose. On a hit the failed turn is emitted as
+ * an empty retryable stream-stall error; result-awaiting callers (`complete`,
+ * `completeSimple`) re-sample it a few times and then let a stubborn loop cook
+ * through one unguarded pass. Disable detection with `PI_NO_THINKING_LOOP_GUARD=1`.
  */
 import { logger } from "@oh-my-pi/pi-utils";
-import type { Api, AssistantMessage, Model } from "../types";
+import * as AIError from "../error";
+import type { Api, AssistantMessage, Model, StreamOptions } from "../types";
 import { AssistantMessageEventStream } from "./event-stream";
 
 /** Stable lead phrase of the guard's error message; exported for tests. The
@@ -63,6 +68,32 @@ const SEGMENT_MIN_COUNT = 8;
 /** Near-duplicate cluster size (current + matches) that trips the loop. */
 const SEGMENT_MIN_CLUSTER = 4;
 
+/** Recent segments whose pooled unigram vocabulary is the novelty baseline for
+ *  progress-lexicon stall detection. */
+const LEX_NOVELTY_WINDOW = 8;
+/** Novelty (fraction of a segment's content words unseen across the recent
+ *  window) at/below which a segment counts as recycling earlier wording.
+ *  Calibrated against 536k real non-Gemini reasoning blocks: at 0.2 the longest
+ *  low-information run any legitimate block reached was 7. */
+const LEX_STALL_NOVELTY_FLOOR = 0.2;
+/** Consecutive low-information segments that trip a progress-lexicon stall. Set
+ *  to 8 (one above the worst legitimate run observed in the 536k-block corpus) so
+ *  the heuristic stays clear of focused reasoning that briefly recycles wording;
+ *  the real reasoning-summarizer loop sustains far longer runs (10+). */
+const LEX_STALL_MIN_RUN = 8;
+
+/** A concrete reference the model is actually reasoning about: a code span, a
+ *  file extension / dotted member, a multi-segment path, or a snake/camel/Pascal
+ *  identifier. A segment that introduces a NEW one resets the lexical-stall run —
+ *  this spares genuine per-target work (per-file templates, focused single-symbol
+ *  debugging) while still catching reworded filler that names nothing new ("just
+ *  doing it, pushing ahead") or fixates on one unchanging reference. Excludes bare
+ *  digits, abbreviations, and decimals (e.g. "Step 2", "i.e.", "1.2") so numbered
+ *  or punctuated filler is not self-anchoring. Global flag: collected with
+ *  matchAll, so never used with the stateful test(). */
+const CONCRETE_ANCHOR =
+	/`[^`]+`|\b\w{2,}\.[a-zA-Z]\w{0,4}\b|[\w-]+(?:\/[\w-]+){2,}|\b\w+_\w+\b|\b[a-z]+[A-Z]\w*\b|\b[A-Z][a-z]+[A-Z]\w*\b/g;
+
 const OPENAI_COMPAT_GUARDED_APIS: Partial<Record<Api, true>> = {
 	"openai-completions": true,
 	"openai-responses": true,
@@ -71,22 +102,37 @@ const OPENAI_COMPAT_GUARDED_APIS: Partial<Record<Api, true>> = {
 };
 
 /**
- * True when `model` should be guarded for thinking loops (Gemini only).
+ * True when `model` is a Gemini model whose native thinking stream surfaces the
+ * "thought summary" titles this module's header guard counts.
  *
- * OpenAI-compat transports can serve Gemini under an arbitrary provider/id, so
- * for those we trust the family-derived (and user-overridable)
- * `compat.enableGeminiThinkingLoopGuard` flag set by the catalog. Direct Google
- * transports always carry a clearly gemini-shaped id/provider, so a string
- * match is sufficient (and works for hand-built models without a compat record).
+ * OpenAI-compat transports can serve Gemini under an arbitrary provider/id, so they
+ * carry the explicit `compat.enableGeminiThinkingLoopGuard` flag; direct Gemini
+ * transports carry a clearly shaped id/provider, so a string match is sufficient.
  */
-export function isGeminiThinkingLoopModel(model: Model<Api>): boolean {
+export function isGeminiThinkingModel(model: Model<Api>): boolean {
 	if (OPENAI_COMPAT_GUARDED_APIS[model.api]) {
-		return (
-			(model.compat as { enableGeminiThinkingLoopGuard?: boolean } | undefined)?.enableGeminiThinkingLoopGuard ===
-			true
-		);
+		const compat = model.compat as { enableGeminiThinkingLoopGuard?: boolean } | undefined;
+		return compat?.enableGeminiThinkingLoopGuard === true;
 	}
 	return /gemini/i.test(`${model.provider}/${model.id}`);
+}
+
+/**
+ * True when `model` should be guarded for thinking/response loops (Gemini & DeepSeek).
+ *
+ * OpenAI-compat transports can serve Gemini or DeepSeek under an arbitrary provider/id.
+ * Direct Gemini/DeepSeek transports carry a clearly shaped id/provider, so a string match
+ * is sufficient.
+ */
+export function isLoopGuardedModel(model: Model<Api>, options?: StreamOptions): boolean {
+	if (options?.loopGuard?.enabled === false) return false;
+	const isDeepseek = /deepseek/i.test(`${model.provider}/${model.id}`);
+	return isGeminiThinkingModel(model) || isDeepseek;
+}
+
+/** @deprecated Use isLoopGuardedModel instead. */
+export function isGeminiThinkingLoopModel(model: Model<Api>): boolean {
+	return isLoopGuardedModel(model);
 }
 
 /**
@@ -103,6 +149,15 @@ export class ThinkingLoopDetector {
 	#window: Set<string>[] = [];
 	/** Count of substantial segments seen so far (warm-up gate). */
 	#count = 0;
+	/** Unigram word sets of the most recent segments (≤ LEX_NOVELTY_WINDOW); the
+	 *  novelty baseline for progress-lexicon stall detection. */
+	#wordWindow: Set<string>[] = [];
+	/** Consecutive low-information (low-novelty, anchor-free) segments seen. */
+	#lexStallRun = 0;
+	/** Concrete anchors seen per recent segment (≤ LEX_NOVELTY_WINDOW). A stall is
+	 *  only broken by a *new* reference, so filler repeating one fixed
+	 *  path/identifier every paragraph is still caught. */
+	#anchorWindow: Set<string>[] = [];
 
 	push(delta: string): string | null {
 		if (!delta) return null;
@@ -157,24 +212,143 @@ export class ThinkingLoopDetector {
 		return null;
 	}
 
-	#consumeSegment(segment: string): string | null {
+	#consumeSegment(raw: string): string | null {
+		// Reasoning-summarizer titles ("**Maintaining Momentum**", "## Heading")
+		// are per-thought formatting, not chain-of-thought; their ever-changing
+		// wording would otherwise mask a loop by inflating novelty. Strip them
+		// before analysis (a title-only segment then falls below the length gate).
+		const segment = raw.replace(/^[ \t]*#{1,6}[ \t].*$/gm, "").replace(/^[ \t]*\*{2,3}.+?\*{2,3}[ \t]*$/gm, "");
 		const normalized = normalizeSegment(segment);
 		if (normalized.length < SEGMENT_MIN_NORM_CHARS) return null;
 
+		// (a) Near-duplicate trigram cluster: the same paragraph reused with
+		// cosmetic wording drift (high word-trigram overlap).
 		const fingerprint = trigramShingles(normalized);
 		let cluster = 1;
 		for (const prev of this.#window) {
 			if (jaccard(fingerprint, prev) >= SEGMENT_SIMILARITY) cluster++;
 		}
 
+		// (b) Progress-lexicon stall: paragraphs that recycle the recent
+		// vocabulary (low novelty) and add no *new* concrete reference — reworded
+		// filler that burns budget without advancing. The trigram check above
+		// already claims high-overlap near-duplicates; this catches the
+		// low-overlap, reshuffled-wording shape it misses. Requiring a NEW anchor
+		// (not merely any anchor) still catches filler that name-drops one fixed
+		// path/identifier every paragraph, while sparing genuine per-target work
+		// that names a fresh file/symbol each time.
+		const words = new Set<string>(normalized.split(" ").filter(Boolean));
+		const priorVocab = new Set<string>();
+		for (const set of this.#wordWindow) for (const w of set) priorVocab.add(w);
+		let unseen = 0;
+		for (const w of words) if (!priorVocab.has(w)) unseen++;
+		const novelty = priorVocab.size === 0 ? 1 : unseen / words.size;
+
+		const anchors = new Set<string>();
+		// Canonicalize so the same reference written as `Foo`, Foo, or FOO is one
+		// anchor and cannot masquerade as "new" to keep a fixed-reference stall alive.
+		for (const match of segment.matchAll(CONCRETE_ANCHOR)) anchors.add(match[0].replace(/`/g, "").toLowerCase());
+		let newAnchor = false;
+		for (const anchor of anchors) {
+			if (this.#anchorWindow.every(seen => !seen.has(anchor))) {
+				newAnchor = true;
+				break;
+			}
+		}
+
+		if (novelty <= LEX_STALL_NOVELTY_FLOOR && !newAnchor) {
+			this.#lexStallRun++;
+		} else {
+			this.#lexStallRun = 0;
+		}
+
 		this.#window.push(fingerprint);
 		if (this.#window.length > SEGMENT_WINDOW) this.#window.shift();
+		this.#wordWindow.push(words);
+		if (this.#wordWindow.length > LEX_NOVELTY_WINDOW) this.#wordWindow.shift();
+		this.#anchorWindow.push(anchors);
+		if (this.#anchorWindow.length > LEX_NOVELTY_WINDOW) this.#anchorWindow.shift();
 		this.#count++;
 
-		if (this.#count >= SEGMENT_MIN_COUNT && cluster >= SEGMENT_MIN_CLUSTER) {
-			return `${cluster} near-identical segments within the last ${SEGMENT_WINDOW}`;
+		if (this.#count >= SEGMENT_MIN_COUNT) {
+			if (cluster >= SEGMENT_MIN_CLUSTER) {
+				return `${cluster} near-identical segments within the last ${SEGMENT_WINDOW}`;
+			}
+			if (this.#lexStallRun >= LEX_STALL_MIN_RUN) {
+				return `${this.#lexStallRun} low-information segments recycling recent wording`;
+			}
 		}
 		return null;
+	}
+}
+
+/**
+ * Consecutive Gemini thought-summary headers in one uninterrupted reasoning
+ * stream that trips the tool-call reminder. Gemini occasionally narrates a long
+ * chain of titled summaries ("Examining Result Handling", "Refining Result
+ * Rendering", …) without ever calling a tool, burning the whole budget on
+ * planning; at this many distinct titles it has almost certainly stalled. This
+ * is the over-planning shape {@link ThinkingLoopDetector} misses — those titles
+ * are stripped before its similarity analysis precisely because their wording
+ * keeps changing, so a genuinely-distinct planning runaway never trips it.
+ */
+export const GEMINI_HEADER_RUNAWAY_THRESHOLD = 10;
+
+/**
+ * True when a single trimmed line is a Gemini reasoning-summary title: a markdown
+ * ATX heading (`## …`) or a whole-line bold / bold-italic run (`**Title**`,
+ * `***Title***`). Inline emphasis inside prose never matches — the bold run must
+ * span the entire line. Mirrors the title shapes {@link ThinkingLoopDetector}
+ * strips before similarity analysis.
+ */
+export function isReasoningSummaryHeader(line: string): boolean {
+	return /^#{1,6}[ \t]+\S/.test(line) || /^\*{2,3}.+\*{2,3}$/.test(line);
+}
+
+/**
+ * Counts consecutive Gemini reasoning-summary headers across a streamed thinking
+ * block. {@link push} returns true exactly once — when the running header count
+ * first reaches {@link GEMINI_HEADER_RUNAWAY_THRESHOLD} — and the caller then
+ * interrupts the stream and reminds the model to issue a tool call. Paragraph
+ * lines between titles do NOT reset the run (Gemini emits header + paragraph per
+ * thought, so the run IS the number of summaries); leaving the reasoning channel
+ * does, via {@link reset} on a new thinking block / prose / tool call.
+ */
+export class GeminiHeaderRunDetector {
+	/** Thinking text not yet split into completed lines. */
+	#pending = "";
+	/** Summary-title lines seen in the current run. */
+	#count = 0;
+	/** Latches after the first threshold hit so each run fires at most once. */
+	#fired = false;
+
+	/** Feed a thinking delta. Returns true the first time the run hits the threshold. */
+	push(delta: string): boolean {
+		if (this.#fired || !delta) return false;
+		this.#pending += delta;
+		let nl = this.#pending.indexOf("\n");
+		while (nl !== -1) {
+			const line = this.#pending.slice(0, nl).trim();
+			this.#pending = this.#pending.slice(nl + 1);
+			if (line !== "" && isReasoningSummaryHeader(line) && ++this.#count >= GEMINI_HEADER_RUNAWAY_THRESHOLD) {
+				this.#fired = true;
+				return true;
+			}
+			nl = this.#pending.indexOf("\n");
+		}
+		return false;
+	}
+
+	/** Number of summary titles counted in the current run (for the reminder/log). */
+	get count(): number {
+		return this.#count;
+	}
+
+	/** Re-arm for a fresh reasoning block: clears the buffer, count, and latch. */
+	reset(): void {
+		this.#pending = "";
+		this.#count = 0;
+		this.#fired = false;
 	}
 }
 
@@ -188,42 +362,54 @@ export function guardThinkingLoopStream(
 	inner: AssistantMessageEventStream,
 	model: Model<Api>,
 	controller: AbortController,
+	options?: StreamOptions,
 ): AssistantMessageEventStream {
 	const outer = new AssistantMessageEventStream();
-	const detector = new ThinkingLoopDetector();
+	const thinkingDetector = new ThinkingLoopDetector();
+	const textDetector = new ThinkingLoopDetector();
+	const checkAssistantContent = options?.loopGuard?.checkAssistantContent !== false;
 
 	void (async () => {
-		// Once any visible answer text or tool call starts, disarm: some providers
-		// (e.g. openai-completions with cumulative `reasoning_content`) re-emit
-		// fresh thinking deltas after `</think>`, and tripping the retriable path
-		// then would discard already-streamed observable output.
-		let armed = true;
+		let thinkingArmed = true;
+		let textArmed = checkAssistantContent;
 		try {
 			for await (const event of inner) {
 				let detail: string | null = null;
-				if (armed && event.type === "thinking_delta") {
-					detail = detector.push(event.delta);
-				} else if (armed && (event.type === "thinking_end" || event.type === "done")) {
-					// Final paragraph of the block has no trailing blank line; flush it
-					// so the segment that completes a cluster is not dropped. `done`
-					// is the backstop for providers that omit a trailing thinking_end.
-					detail = detector.flush();
-				} else if (
-					event.type === "text_start" ||
-					event.type === "text_delta" ||
-					event.type === "toolcall_start" ||
-					event.type === "toolcall_delta"
-				) {
-					armed = false;
+				if (thinkingArmed && event.type === "thinking_delta") {
+					detail = thinkingDetector.push(event.delta);
+				} else if (thinkingArmed && event.type === "thinking_end") {
+					detail = thinkingDetector.flush();
+					thinkingArmed = false;
+				} else if (event.type === "text_start" || event.type === "text_delta") {
+					thinkingArmed = false;
+					if (textArmed && event.type === "text_delta") {
+						detail = textDetector.push(event.delta);
+					}
+				} else if (event.type === "toolcall_start" || event.type === "toolcall_delta") {
+					thinkingArmed = false;
+					textArmed = false;
+				} else if (event.type === "done") {
+					if (thinkingArmed) {
+						detail = thinkingDetector.flush();
+					}
+					if (textArmed) {
+						detail = detail || textDetector.flush();
+					}
 				}
 				if (detail) {
-					logger.warn("Gemini thinking loop detected; aborting stream for retry.", {
+					logger.warn("Thinking loop detected; aborting stream for retry.", {
 						model: model.id,
 						provider: model.provider,
 						detail,
 					});
-					controller.abort(new Error(THINKING_LOOP_ERROR_MARKER));
-					outer.push({ type: "error", reason: "error", error: buildThinkingLoopError(model, detail) });
+					controller.abort(
+						AIError.attach(new Error(THINKING_LOOP_ERROR_MARKER), AIError.create(AIError.Flag.ThinkingLoop)),
+					);
+					outer.push({
+						type: "error",
+						reason: "error",
+						error: buildThinkingLoopError(model, detail),
+					});
 					return;
 				}
 				outer.push(event);
@@ -245,31 +431,36 @@ export function guardThinkingLoopStream(
 }
 
 /**
- * Apply the Gemini loop guard around a provider dispatch. For non-Gemini models
- * (or when disabled) this is a transparent pass-through. For Gemini it injects a
+ * Apply the loop guard around a provider dispatch. For non-guarded models
+ * (or when disabled) this is a transparent pass-through. For guarded models it injects a
  * guard abort signal into the provider call so a detected loop tears down the
- * upstream, then wraps the returned stream.
+ * upstream, then wraps the returned stream. The guard only raises the retryable
+ * stall; bounding the re-samples and the final cook pass lives in the
+ * result-awaiting caller.
  */
-export function withGeminiThinkingLoopGuard<O extends { signal?: AbortSignal }>(
+export function withGeminiThinkingLoopGuard<
+	O extends { signal?: AbortSignal; loopGuard?: { enabled?: boolean; checkAssistantContent?: boolean } },
+>(
 	model: Model<Api>,
 	options: O | undefined,
 	dispatch: (options: O | undefined) => AssistantMessageEventStream,
 ): AssistantMessageEventStream {
-	if (process.env.PI_NO_THINKING_LOOP_GUARD === "1" || !isGeminiThinkingLoopModel(model)) {
+	if (process.env.PI_NO_THINKING_LOOP_GUARD === "1" || !isLoopGuardedModel(model, options)) {
 		return dispatch(options);
 	}
 	const controller = new AbortController();
 	const caller = options?.signal;
 	const signal = caller ? AbortSignal.any([caller, controller.signal]) : controller.signal;
 	const merged = { ...(options ?? {}), signal } as O;
-	return guardThinkingLoopStream(dispatch(merged), model, controller);
+	return guardThinkingLoopStream(dispatch(merged), model, controller, options);
 }
 
 function buildThinkingLoopError(model: Model<Api>, detail: string): AssistantMessage {
 	return {
 		role: "assistant",
-		// Empty content is load-bearing: a contentful error stop is replay-unsafe
-		// and would NOT be auto-retried by the session.
+		// Empty content is load-bearing: loop-guard output is replay garbage, even
+		// when it arrived as assistant text instead of native thinking. Keeping it
+		// would persist the failed attempt before AgentSession retries.
 		content: [],
 		api: model.api,
 		provider: model.provider,
@@ -285,7 +476,8 @@ function buildThinkingLoopError(model: Model<Api>, detail: string): AssistantMes
 		stopReason: "error",
 		// "stream stall" makes the transport/session retry classifiers treat this
 		// as a transient (retryable) failure with no bespoke rule.
-		errorMessage: `${THINKING_LOOP_ERROR_MARKER}: the model repeated near-identical reasoning (${detail}). Treating as a stream stall and retrying.`,
+		errorMessage: `${THINKING_LOOP_ERROR_MARKER}: the model repeated near-identical content (${detail}). Treating as a stream stall and retrying.`,
+		errorId: AIError.create(AIError.Flag.ThinkingLoop),
 		timestamp: Date.now(),
 	};
 }
@@ -320,14 +512,15 @@ function detectVerbatimRepetition(text: string): [unit: string, count: number] |
 	return null;
 }
 
-/** Lowercase, drop code spans / paths / digits, keep only letter words. */
+/** Lowercase and tokenize prose plus code/path payloads, dropping pure numbers. */
 function normalizeSegment(segment: string): string {
 	return segment
 		.toLowerCase()
-		.replace(/`[^`]*`/g, " ")
-		.replace(/\/[^\s`]+/g, " ")
-		.replace(/\d+/g, " ")
-		.replace(/[^a-z]+/g, " ")
+		.replace(/`([^`]*)`/g, " $1 ")
+		.replace(/[^a-z0-9]+/g, " ")
+		.split(/\s+/)
+		.filter(token => /[a-z]/.test(token))
+		.join(" ")
 		.trim();
 }
 

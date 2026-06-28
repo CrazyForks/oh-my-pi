@@ -19,7 +19,7 @@ import type { AgentTool, AgentToolContext, AgentToolResult, AgentToolUpdateCallb
 import type { ToolExample } from "@oh-my-pi/pi-ai";
 import { type Component, Markdown, type MarkdownTheme, renderInlineMarkdown, TERMINAL, Text } from "@oh-my-pi/pi-tui";
 import { prompt, untilAborted } from "@oh-my-pi/pi-utils";
-import { z } from "zod/v4";
+import { type as arkType } from "arktype";
 import type { RenderResultOptions } from "../extensibility/custom-tools/types";
 import type { ExtensionUISelectItem } from "../extensibility/extensions";
 import { getMarkdownTheme, type Theme, theme } from "../modes/theme/theme";
@@ -34,24 +34,24 @@ import { ToolAbortError } from "./tool-errors";
 // Types
 // =============================================================================
 
-const OptionItem = z.object({
-	label: z.string().describe("display label"),
-	description: z.string().describe("optional explanatory text displayed below the label").optional(),
+const OptionItem = arkType({
+	label: arkType("string").describe("display label"),
+	"description?": arkType("string").describe("optional explanatory text displayed below the label"),
 });
 
-const QuestionItem = z.object({
-	id: z.string().describe("question id"),
-	question: z.string().describe("question text"),
-	options: z.array(OptionItem).describe("available options"),
-	multi: z.boolean().describe("allow multiple selections").optional(),
-	recommended: z.number().describe("recommended option index").optional(),
+const QuestionItem = arkType({
+	id: arkType("string").describe("question id"),
+	question: arkType("string").describe("question text"),
+	options: OptionItem.array().describe("available options"),
+	"multi?": arkType("boolean").describe("allow multiple selections"),
+	"recommended?": arkType("number").describe("recommended option index"),
 });
 
-const askSchema = z.object({
-	questions: z.array(QuestionItem).min(1).describe("questions to ask"),
+const askSchema = arkType({
+	questions: QuestionItem.array().atLeastLength(1).describe("questions to ask"),
 });
 
-export type AskToolInput = z.infer<typeof askSchema>;
+export type AskToolInput = typeof askSchema.infer;
 
 /** Result for a single question */
 export interface QuestionResult {
@@ -134,6 +134,45 @@ function getAutoSelectionOnTimeout(options: AskOption[], recommended?: number): 
 /** Strip "(Recommended)" suffix from a label */
 function stripRecommendedSuffix(label: string): string {
 	return label.endsWith(RECOMMENDED_SUFFIX) ? label.slice(0, -RECOMMENDED_SUFFIX.length) : label;
+}
+
+interface CustomInputContext {
+	selectionMarker: "radio" | "checkbox";
+	checkedIndices?: readonly number[];
+	markableCount: number;
+}
+
+function getSelectOptionDescription(option: ExtensionUISelectItem): string | undefined {
+	return typeof option === "string" ? undefined : option.description;
+}
+
+function formatCustomInputTitle(
+	question: string,
+	options: ExtensionUISelectItem[],
+	context: CustomInputContext,
+): string {
+	const selectedIndex = options.findIndex(option => getSelectOptionLabel(option) === OTHER_OPTION);
+	const lines = [question, ""];
+	const checked = new Set(context.checkedIndices ?? []);
+	for (let index = 0; index < options.length; index++) {
+		const option = options[index]!;
+		const label = getSelectOptionLabel(option);
+		const isSelected = index === selectedIndex;
+		const isMarkable = index < context.markableCount;
+		const prefix =
+			context.selectionMarker === "radio" && (isMarkable || isSelected)
+				? `${isSelected ? theme.radio.selected : theme.radio.unselected} `
+				: context.selectionMarker === "checkbox" && isMarkable
+					? `${checked.has(index) ? theme.checkbox.checked : theme.checkbox.unchecked} `
+					: isSelected
+						? `${theme.nav.cursor} `
+						: "  ";
+		lines.push(prefix + label);
+		const description = getSelectOptionDescription(option);
+		if (description) lines.push(`    ${description}`);
+	}
+	lines.push("", "Enter your response:");
+	return lines.join("\n");
 }
 
 // =============================================================================
@@ -250,9 +289,14 @@ async function askSingleQuestion(
 		return { choice, timedOut: timeoutTriggered, navigation: navigationAction };
 	};
 
-	const promptForCustomInput = async (): Promise<{ input: string | undefined }> => {
+	const promptForCustomInput = async (
+		title: string,
+		optionsToShow: ExtensionUISelectItem[],
+		context: CustomInputContext,
+	): Promise<{ input: string | undefined }> => {
 		const dialogOptions = signal ? { signal } : undefined;
-		const showCustomInput = () => ui.editor("Enter your response:", undefined, dialogOptions, { promptStyle: true });
+		const editorTitle = formatCustomInputTitle(title, optionsToShow, context);
+		const showCustomInput = () => ui.editor(editorTitle, undefined, dialogOptions, { promptStyle: true });
 		const input = signal ? await untilAborted(signal, showCustomInput) : await showCustomInput();
 		return { input };
 	};
@@ -306,9 +350,13 @@ async function askSingleQuestion(
 					timedOut = true;
 					break;
 				}
-				const customResult = await promptForCustomInput();
+				const customResult = await promptForCustomInput(`${prefix}${promptWithProgress}`, opts, {
+					selectionMarker: "checkbox",
+					checkedIndices,
+					markableCount: questionOptions.length,
+				});
 				if (customResult.input === undefined) {
-					break;
+					continue;
 				}
 				customInput = customResult.input;
 				break;
@@ -332,51 +380,60 @@ async function askSingleQuestion(
 		}
 		selectedOptions = Array.from(selected);
 	} else {
-		const displayOptions = addRecommendedSuffix(questionOptions, recommended);
-		const optionsWithNavigation: ExtensionUISelectItem[] = [...displayOptions, OTHER_OPTION];
+		while (true) {
+			const displayOptions = addRecommendedSuffix(questionOptions, recommended);
+			const optionsWithNavigation: ExtensionUISelectItem[] = [...displayOptions, OTHER_OPTION];
 
-		let initialIndex = recommended;
-		const previouslySelected = selectedOptions[0];
-		if (previouslySelected) {
-			const selectedIndex = questionOptions.findIndex(option => option.label === previouslySelected);
-			if (selectedIndex >= 0) initialIndex = selectedIndex;
-		} else if (customInput !== undefined) {
-			initialIndex = displayOptions.length;
-		}
-		if (initialIndex !== undefined) {
-			const maxIndex = Math.max(optionsWithNavigation.length - 1, 0);
-			initialIndex = Math.max(0, Math.min(initialIndex, maxIndex));
-		}
-
-		const {
-			choice,
-			timedOut: selectTimedOut,
-			navigation: arrowNavigation,
-		} = await selectOption(promptWithProgress, optionsWithNavigation, initialIndex, {
-			selectionMarker: "radio",
-			markableCount: displayOptions.length,
-		});
-		timedOut = selectTimedOut;
-
-		if (arrowNavigation) {
-			return { selectedOptions, customInput, timedOut, navigation: arrowNavigation };
-		}
-		if (choice === undefined) {
-			if (!timedOut) {
-				return { selectedOptions, customInput, timedOut, cancelled: true };
+			let initialIndex = recommended;
+			const previouslySelected = selectedOptions[0];
+			if (previouslySelected) {
+				const selectedIndex = questionOptions.findIndex(option => option.label === previouslySelected);
+				if (selectedIndex >= 0) initialIndex = selectedIndex;
+			} else if (customInput !== undefined) {
+				initialIndex = displayOptions.length;
 			}
-		} else if (choice === OTHER_OPTION) {
-			if (!selectTimedOut) {
-				const customResult = await promptForCustomInput();
-				if (customResult.input !== undefined) {
-					customInput = customResult.input;
-					selectedOptions = [];
+			if (initialIndex !== undefined) {
+				const maxIndex = Math.max(optionsWithNavigation.length - 1, 0);
+				initialIndex = Math.max(0, Math.min(initialIndex, maxIndex));
+			}
+
+			const {
+				choice,
+				timedOut: selectTimedOut,
+				navigation: arrowNavigation,
+			} = await selectOption(promptWithProgress, optionsWithNavigation, initialIndex, {
+				selectionMarker: "radio",
+				markableCount: displayOptions.length,
+			});
+			timedOut = selectTimedOut;
+
+			if (arrowNavigation) {
+				return { selectedOptions, customInput, timedOut, navigation: arrowNavigation };
+			}
+			if (choice === undefined) {
+				if (!timedOut) {
+					return { selectedOptions, customInput, timedOut, cancelled: true };
 				}
-				// If editor was dismissed (undefined), keep prior selectedOptions/customInput intact
+				break;
 			}
-		} else {
+			if (choice === OTHER_OPTION) {
+				if (selectTimedOut) {
+					break;
+				}
+				const customResult = await promptForCustomInput(promptWithProgress, optionsWithNavigation, {
+					selectionMarker: "radio",
+					markableCount: displayOptions.length,
+				});
+				if (customResult.input === undefined) {
+					continue;
+				}
+				customInput = customResult.input;
+				selectedOptions = [];
+				break;
+			}
 			selectedOptions = [stripRecommendedSuffix(choice)];
 			customInput = undefined;
+			break;
 		}
 		if (navigation?.allowForward) {
 			return { selectedOptions, customInput, timedOut, navigation: "forward" };
@@ -424,7 +481,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 	readonly parameters = askSchema;
 	readonly strict = true;
 
-	readonly examples: readonly ToolExample<z.input<typeof askSchema>>[] = [
+	readonly examples: readonly ToolExample<typeof askSchema.infer>[] = [
 		{
 			caption: "Single question",
 			call: {

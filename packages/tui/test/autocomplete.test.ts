@@ -61,6 +61,64 @@ describe("CombinedAutocompleteProvider", () => {
 		});
 	});
 
+	describe("slash commands", () => {
+		it("suggests only skill commands after prose", async () => {
+			const provider = new CombinedAutocompleteProvider(
+				[
+					{ name: "skill:security-scan", description: "Security scan" },
+					{ name: "model", description: "Switch model" },
+				],
+				"/tmp",
+			);
+			const line = "run /security";
+
+			const result = await provider.getSuggestions([line], 0, line.length);
+
+			expect(result?.prefix).toBe("/security");
+			expect(result?.items.map(item => item.value)).toEqual(["skill:security-scan"]);
+		});
+
+		it("suggests only skill commands after prior prompt lines", async () => {
+			const provider = new CombinedAutocompleteProvider(
+				[
+					{ name: "skill:security-scan", description: "Security scan" },
+					{ name: "model", description: "Switch model" },
+				],
+				"/tmp",
+			);
+
+			const result = await provider.getSuggestions(["there is an issue", "/skill:"], 1, "/skill:".length);
+
+			expect(result?.prefix).toBe("/skill:");
+			expect(result?.items.map(item => item.value)).toEqual(["skill:security-scan"]);
+		});
+
+		it("does not suggest skills when the slash is inside a word", async () => {
+			const provider = new CombinedAutocompleteProvider(
+				[{ name: "skill:security-scan", description: "Security scan" }],
+				"/tmp",
+			);
+			const line = "word/security";
+
+			const result = await provider.getSuggestions([line], 0, line.length);
+
+			expect(result).toBeNull();
+		});
+
+		it("falls back to path suggestions for an unmatched mid-prompt slash token", async () => {
+			const provider = new CombinedAutocompleteProvider(
+				[{ name: "skill:security-scan", description: "Security scan" }],
+				"/tmp",
+			);
+			const line = "see /tmp";
+
+			const result = await provider.getSuggestions([line], 0, line.length);
+
+			expect(result).not.toBeNull();
+			expect(result?.prefix).toBe("/tmp");
+			expect(result?.items.map(item => item.value)).toContain("/tmp/");
+		});
+	});
 	describe("applyCompletion", () => {
 		it("replaces the live slash command prefix when rendered suggestions are stale", () => {
 			const provider = new CombinedAutocompleteProvider([], "/tmp");
@@ -74,6 +132,43 @@ describe("CombinedAutocompleteProvider", () => {
 
 			expect(result.lines[0]).toBe("/skills:fix-bug ");
 			expect(result.cursorCol).toBe("/skills:fix-bug ".length);
+		});
+
+		it("preserves leading whitespace when applying a slash command completion", () => {
+			const provider = new CombinedAutocompleteProvider([], "/tmp");
+			const result = provider.applyCompletion(
+				["  /ski"],
+				0,
+				6,
+				{ value: "skills:fix-bug", label: "/skills:fix-bug" },
+				"/s",
+			);
+
+			expect(result.lines[0]).toBe("  /skills:fix-bug ");
+			expect(result.cursorCol).toBe("  /skills:fix-bug ".length);
+		});
+
+		it("applies a slash completion whose prefix carries leading whitespace", () => {
+			const provider = new CombinedAutocompleteProvider([], "/tmp");
+			const result = provider.applyCompletion(["  /sk"], 0, 5, { value: "skill", label: "skill" }, "  /sk");
+
+			expect(result.lines[0]).toBe("  /skill ");
+			expect(result.cursorCol).toBe("  /skill ".length);
+		});
+
+		it("replaces the whole draft when applying a mid-prompt skill completion", () => {
+			const provider = new CombinedAutocompleteProvider([], "/tmp");
+			const result = provider.applyCompletion(
+				["explain this", "then use /security"],
+				1,
+				"then use /security".length,
+				{ value: "skill:security-scan", label: "/skill:security-scan" },
+				"/security",
+			);
+
+			expect(result.lines).toEqual(["/skill:security-scan"]);
+			expect(result.cursorLine).toBe(0);
+			expect(result.cursorCol).toBe("/skill:security-scan".length);
 		});
 
 		it("preserves earlier slash command arguments when completing a path inside the last argument", () => {
@@ -200,6 +295,23 @@ describe("CombinedAutocompleteProvider", () => {
 			expect(values.some(value => value.includes("/deep/"))).toBe(false);
 		});
 
+		it("normalizes backslash separators in a relative @..\\ prefix (Windows-style input)", async () => {
+			// Mirrors the @../ test but with Windows-native backslashes. The fix
+			// normalizes "\\" -> "/" before the path splitting/joining, so this is
+			// catchable on POSIX CI. On the pre-fix code POSIX path.dirname/basename
+			// treat "\\" as a literal char and the prefix yields no suggestions.
+			fs.mkdirSync(path.join(outsideDir, "workspace"), { recursive: true });
+			fs.mkdirSync(path.join(outsideDir, "workflows"), { recursive: true });
+
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = "@..\\outside\\wor";
+			const result = await provider.getSuggestions([line], 0, line.length);
+
+			const values = result?.items.map(item => item.value) ?? [];
+			expect(values).toContain("@../outside/workspace/");
+			expect(values).toContain("@../outside/workflows/");
+		});
+
 		it("lists entries inside an absolute @/abs/ path without walking recursively", async () => {
 			fs.mkdirSync(path.join(outsideDir, "alpha"), { recursive: true });
 			fs.mkdirSync(path.join(outsideDir, "beta"), { recursive: true });
@@ -210,11 +322,30 @@ describe("CombinedAutocompleteProvider", () => {
 			const result = await provider.getSuggestions([line], 0, line.length);
 
 			const values = result?.items.map(item => item.value) ?? [];
-			expect(values).toContain(`@${outsideDir}/alpha/`);
-			expect(values).toContain(`@${outsideDir}/beta/`);
+			// Normalize to forward slashes — the provider normalizes suggestion paths
+			// so they work consistently on all platforms (forward slashes are valid on Windows).
+			const normalizedOutsideDir = outsideDir.replace(/\\/g, "/");
+			expect(values).toContain(`@${normalizedOutsideDir}/alpha/`);
+			expect(values).toContain(`@${normalizedOutsideDir}/beta/`);
 			expect(values.some(value => value.endsWith("nested.ts"))).toBe(false);
 		});
+
+		it("preserves the full absolute prefix when completing a partial leaf", async () => {
+			fs.mkdirSync(path.join(outsideDir, "alpha"), { recursive: true });
+			fs.mkdirSync(path.join(outsideDir, "beta"), { recursive: true });
+
+			const provider = new CombinedAutocompleteProvider([], baseDir);
+			const line = `@${outsideDir}/a`;
+			const result = await provider.getSuggestions([line], 0, line.length);
+
+			const values = result?.items.map(item => item.value) ?? [];
+			const normalizedOutsideDir = outsideDir.replace(/\\/g, "/");
+			expect(values).toContain(`@${normalizedOutsideDir}/alpha/`);
+			// The parent path must be preserved, not stripped to just the leaf name
+			expect(values.some(v => v === "@alpha/")).toBe(false);
+		});
 	});
+
 	describe("dot-slash path completion", () => {
 		let baseDir: string;
 
@@ -284,6 +415,17 @@ describe("trySyncSlashCompletion", () => {
 		expect(result!.items.map(i => i.value)).toEqual(["model"]);
 	});
 
+	it("returns matching items when slash is the first non-whitespace token", () => {
+		const provider = new CombinedAutocompleteProvider(
+			[{ name: "model", description: "Switch AI model", value: "model" }],
+			"/tmp",
+		);
+		const result = provider.trySyncSlashCompletion("  /mo");
+		expect(result).not.toBeNull();
+		expect(result!.prefix).toBe("  /mo");
+		expect(result!.items.map(i => i.value)).toEqual(["model"]);
+	});
+
 	it("matches multiple commands and sorts by relevance", () => {
 		const provider = new CombinedAutocompleteProvider(
 			[
@@ -327,6 +469,37 @@ describe("trySyncSlashCompletion", () => {
 		const result = provider.trySyncSlashCompletion("/model");
 		expect(result).not.toBeNull();
 		expect(result!.items.map(i => i.value)).toContain("md");
+	});
+
+	it("uses dynamic descriptions for slash command suggestions", async () => {
+		let enabled = false;
+		const provider = new CombinedAutocompleteProvider(
+			[
+				{
+					name: "fast",
+					description: "Toggle fast mode",
+					getAutocompleteDescription: () => `Fast: ${enabled ? "on" : "off"}`,
+				},
+			],
+			"/tmp",
+		);
+
+		const off = await provider.getSuggestions(["/fa"], 0, 3);
+		expect(off?.items[0]).toMatchObject({ value: "fast", label: "fast", description: "Fast: off" });
+
+		enabled = true;
+		const on = await provider.getSuggestions(["/fa"], 0, 3);
+		expect(on?.items[0]).toMatchObject({ value: "fast", label: "fast", description: "Fast: on" });
+	});
+
+	it("keeps static slash descriptions as the search corpus", async () => {
+		const provider = new CombinedAutocompleteProvider(
+			[{ name: "fast", description: "Toggle fast mode", getAutocompleteDescription: () => "Fast: enabled" }],
+			"/tmp",
+		);
+
+		expect(await provider.getSuggestions(["/toggle"], 0, "/toggle".length)).not.toBeNull();
+		expect(await provider.getSuggestions(["/enabled"], 0, "/enabled".length)).toBeNull();
 	});
 
 	it("handles AutocompleteItem-shaped commands (no 'name' property)", () => {
@@ -405,5 +578,6 @@ describe("trySyncSlashCompletion", () => {
 			"/tmp",
 		);
 		expect(provider.getInlineHint(["/onboarding pro"], 0, "/onboarding pro".length)).toBe("viders");
+		expect(provider.getInlineHint(["  /onboarding pro"], 0, "  /onboarding pro".length)).toBe("viders");
 	});
 });

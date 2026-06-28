@@ -22,8 +22,8 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { Snowflake } from "@oh-my-pi/pi-utils";
-import { z } from "zod/v4";
+import { removeSyncWithRetries, Snowflake } from "@oh-my-pi/pi-utils";
+import { type } from "arktype";
 import { createAssistantMessage } from "./helpers/agent-session-setup";
 
 // Mock stream that mimics AssistantMessageEventStream
@@ -62,7 +62,7 @@ describe("AgentSession concurrent prompt guard", () => {
 			authStorage.close();
 		}
 		if (tempDir && fs.existsSync(tempDir)) {
-			fs.rmSync(tempDir, { recursive: true });
+			removeSyncWithRetries(tempDir);
 		}
 		vi.restoreAllMocks();
 		AsyncJobManager.resetForTests();
@@ -982,7 +982,7 @@ describe("AgentSession TTSR resume gate", () => {
 			authStorage.close();
 		}
 		if (tempDir && fs.existsSync(tempDir)) {
-			fs.rmSync(tempDir, { recursive: true });
+			removeSyncWithRetries(tempDir);
 		}
 		vi.restoreAllMocks();
 	});
@@ -1194,6 +1194,11 @@ describe("AgentSession TTSR resume gate", () => {
 							delta: 'let val = result.unwrap("oops")',
 							partial,
 						});
+						// The TTSR abort placeholder is only minted for tool calls that reached
+						// `toolcall_end`: the agent loop drops incomplete tool calls from an
+						// aborted turn (partial args are unsafe to replay). Complete the call
+						// before the rule-driven abort fires so the labeled placeholder survives.
+						stream.push({ type: "toolcall_end", contentIndex: 0, toolCall: toolCallContent, partial });
 					});
 				} else {
 					pushContinuationStream(stream, () => {});
@@ -1463,7 +1468,7 @@ describe("AgentSession TTSR resume gate", () => {
 			name: "mock_edit",
 			label: "Mock Edit",
 			description: "A mock edit tool",
-			parameters: z.object({}),
+			parameters: type({}),
 			execute: async () => {
 				toolExecutionFinished = true;
 				return { content: [{ type: "text" as const, text: "edit applied" }] };
@@ -1573,7 +1578,7 @@ describe("AgentSession TTSR resume gate", () => {
 			name: "mock_edit",
 			label: "Mock Edit",
 			description: "A mock edit tool",
-			parameters: z.object({ snippet: z.string().optional() }),
+			parameters: type({ snippet: "string?" }),
 			execute: async () => {
 				toolExecuted = true;
 				return { content: [{ type: "text" as const, text: "edit applied" }] };
@@ -1695,7 +1700,7 @@ describe("AgentSession TTSR resume gate", () => {
 			name: "mock_edit",
 			label: "Mock Edit",
 			description: "A mock edit tool",
-			parameters: z.object({ snippet: z.string().optional() }),
+			parameters: type({ snippet: "string?" }),
 			execute: async () => {
 				executedCount++;
 				return { content: [{ type: "text" as const, text: "edit applied" }] };

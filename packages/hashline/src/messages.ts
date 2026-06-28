@@ -119,6 +119,14 @@ export const UNRESOLVED_BLOCK_INTERNAL =
 /** Delete hunk received a body row. */
 export const DELETE_TAKES_NO_BODY = `\`DEL N${HL_RANGE_SEP}M\` does not take body rows. Remove the body, or use \`SWAP N${HL_RANGE_SEP}M:\`.`;
 
+/** `REM` received a body row or coexists with line edits. */
+export const REM_TAKES_NO_BODY =
+	"`REM` deletes the whole file and takes no body rows or line ops. Issue it alone under the header.";
+
+/** `MV` received a body row. */
+export const MOVE_TAKES_NO_BODY =
+	"`MV DEST` does not take body rows. Put line edits above the `MV` row; the destination path follows `MV` on the same line.";
+
 /** `delete_block N` hunk received a body row. */
 export const DELETE_BLOCK_TAKES_NO_BODY = "`DEL.BLK N` does not take body rows. Remove the body, or use `SWAP.BLK N:`.";
 
@@ -176,6 +184,21 @@ export function missingSnapshotTagMessage(sectionPath: string): string {
 	return `Missing hashline snapshot tag for ${sectionPath}; use \`${HL_FILE_PREFIX}${sectionPath}${HL_FILE_HASH_SEP}tag${HL_FILE_SUFFIX}\` from your latest read/search output. To create a new file, use the write tool.`;
 }
 
+/**
+ * A section named a path that does not exist, but its filename and snapshot
+ * tag together match exactly one file read earlier this session — the model
+ * gave the bare filename (or wrong directory) for a file it just read. The
+ * edit was rebound to that file's full path. Surfaced as a warning so the
+ * model (and user) learn the corrected path and stop reusing the wrong one.
+ */
+export function pathRecoveredFromTagMessage(authoredPath: string, resolvedPath: string, tag: string): string {
+	return (
+		`Path "${authoredPath}" does not exist; matched its filename and snapshot tag ` +
+		`${HL_FILE_HASH_SEP}${tag} to ${resolvedPath} (read earlier this session). Anchor future edits on ` +
+		`${HL_FILE_PREFIX}${resolvedPath}${HL_FILE_HASH_SEP}TAG${HL_FILE_SUFFIX}.`
+	);
+}
+
 /** Compress a line list into a sorted `1-4, 7, 10-12` range string. */
 function formatLineRanges(lines: readonly number[]): string {
 	const sorted = [...new Set(lines)].sort((a, b) => a - b);
@@ -203,12 +226,14 @@ function formatLineRanges(lines: readonly number[]): string {
  * files; reject and make the model re-read those exact lines first.
  */
 export function unseenLinesMessage(sectionPath: string, unseenLines: readonly number[], tag: string): string {
+	const ranges = formatLineRanges(unseenLines);
+	const selector = ranges.replace(/, /g, ",");
 	return (
-		`This edit targets line(s) ${formatLineRanges(unseenLines)} of ${sectionPath} that were not shown in the ` +
-		`read/search output for ${HL_FILE_PREFIX}${sectionPath}${HL_FILE_HASH_SEP}${tag}${HL_FILE_SUFFIX} — a partial ` +
-		`range, a search hit, or a structural summary that collapsed bodies was displayed, not those exact lines. ` +
-		`Re-read those lines, then re-issue the edit against the fresh tag. NEVER author hunks against line numbers ` +
-		`you have not seen in the current snapshot.`
+		`This edit anchors to lines ${ranges} of ${sectionPath} that ` +
+		`${HL_FILE_PREFIX}${sectionPath}${HL_FILE_HASH_SEP}${tag}${HL_FILE_SUFFIX} never displayed (it showed a ` +
+		`partial range, a search hit, or a folded summary). Re-read them in full first with a ranged read like ` +
+		`\`${sectionPath}:${selector}\` — it skips summarization and mints a fresh tag (a plain re-read just re-folds ` +
+		`them) — then re-issue the edit.`
 	);
 }
 

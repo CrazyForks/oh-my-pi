@@ -1,7 +1,11 @@
 import { describe, expect, it } from "bun:test";
 import { applyAnthropicUsageExtras } from "@oh-my-pi/pi-ai/providers/anthropic";
 import { parseChunkUsage } from "@oh-my-pi/pi-ai/providers/openai-completions";
-import type { Model, Usage } from "@oh-my-pi/pi-ai/types";
+import {
+	calculateOpenAIUsageAccounting,
+	populateResponsesUsageFromResponse,
+} from "@oh-my-pi/pi-ai/providers/openai-shared";
+import type { AssistantMessage, Model, Usage } from "@oh-my-pi/pi-ai/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 
 const OPENAI_MODEL: Model<"openai-completions"> = buildModel({
@@ -200,6 +204,93 @@ describe("openai-completions parseChunkUsage", () => {
 		expect(usage.cacheRead).toBe(200);
 		expect(usage.cacheWrite).toBe(5_000);
 		expect(usage.totalTokens).toBe(6_250);
+	});
+});
+
+describe("shared OpenAI usage accounting", () => {
+	it("uses provider cache-write details ahead of native DeepSeek passthrough fields", () => {
+		const usage = calculateOpenAIUsageAccounting({
+			promptTokens: 6_000,
+			outputTokens: 250,
+			cachedTokens: 200,
+			reasoningTokens: 0,
+			cacheWriteOpenRouter: 5_000,
+			cacheWriteDeepSeek: 50,
+			hasDeepSeekCacheHitAndMiss: true,
+		});
+
+		expect(usage.input).toBe(800);
+		expect(usage.cacheRead).toBe(200);
+		expect(usage.cacheWrite).toBe(5_000);
+		expect(usage.totalTokens).toBe(6_250);
+	});
+
+	it("does not emit DeepSeek cache misses as cache writes", () => {
+		const usage = calculateOpenAIUsageAccounting({
+			promptTokens: 150,
+			outputTokens: 200,
+			cachedTokens: 100,
+			reasoningTokens: 0,
+			cacheWriteOpenRouter: undefined,
+			cacheWriteDeepSeek: 50,
+			hasDeepSeekCacheHitAndMiss: true,
+		});
+
+		expect(usage.input).toBe(50);
+		expect(usage.cacheRead).toBe(100);
+		expect(usage.cacheWrite).toBe(0);
+		expect(usage.totalTokens).toBe(350);
+	});
+
+	it("treats zero provider cache-write as present when native fields pass through", () => {
+		const usage = calculateOpenAIUsageAccounting({
+			promptTokens: 150,
+			outputTokens: 25,
+			cachedTokens: 100,
+			reasoningTokens: 0,
+			cacheWriteOpenRouter: 0,
+			cacheWriteDeepSeek: 50,
+			hasDeepSeekCacheHitAndMiss: true,
+		});
+
+		expect(usage.input).toBe(50);
+		expect(usage.cacheRead).toBe(100);
+		expect(usage.cacheWrite).toBe(0);
+		expect(usage.totalTokens).toBe(175);
+	});
+});
+
+describe("openai-responses usage attribution", () => {
+	it("folds Fugu Ultra orchestration token details into billable usage", () => {
+		const output: AssistantMessage = {
+			role: "assistant",
+			content: [],
+			api: "openai-responses",
+			provider: "sakana",
+			model: "fugu-ultra",
+			usage: blankUsage(),
+			stopReason: "stop",
+			timestamp: 0,
+		};
+
+		populateResponsesUsageFromResponse(output, {
+			input_tokens: 120,
+			output_tokens: 80,
+			total_tokens: 270,
+			input_tokens_details: {
+				cached_tokens: 10,
+				orchestration_input_tokens: 30,
+				orchestration_input_cached_tokens: 5,
+			},
+			output_tokens_details: {
+				orchestration_output_tokens: 40,
+			},
+		});
+
+		expect(output.usage.input).toBe(135);
+		expect(output.usage.cacheRead).toBe(15);
+		expect(output.usage.output).toBe(120);
+		expect(output.usage.totalTokens).toBe(270);
 	});
 });
 

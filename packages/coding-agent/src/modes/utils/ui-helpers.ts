@@ -1,5 +1,6 @@
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import type { AssistantMessage, ImageContent, Message, Usage } from "@oh-my-pi/pi-ai";
+import { getStreamingPartialJson } from "@oh-my-pi/pi-ai/utils/block-symbols";
 import { type Component, Spacer, Text, TruncatedText } from "@oh-my-pi/pi-tui";
 import type { AdvisorMessageDetails } from "../../advisor";
 import { COLLAB_PROMPT_MESSAGE_TYPE, type CollabPromptDetails } from "../../collab/protocol";
@@ -9,9 +10,10 @@ import { createAdvisorMessageCard } from "../../modes/components/advisor-message
 import { AssistantMessageComponent } from "../../modes/components/assistant-message";
 import { createBackgroundTanDispatchBlock } from "../../modes/components/background-tan-message";
 import { BashExecutionComponent } from "../../modes/components/bash-execution";
-import { BranchSummaryMessageComponent } from "../../modes/components/branch-summary-message";
+import { detectCacheInvalidation } from "../../modes/components/cache-invalidation-marker";
 import { CollabPromptMessageComponent } from "../../modes/components/collab-prompt-message";
 import {
+	BranchSummaryMessageComponent,
 	CompactionSummaryMessageComponent,
 	createHandoffSummaryMessageComponent,
 } from "../../modes/components/compaction-summary-message";
@@ -38,16 +40,21 @@ import type { CompactionQueuedMessage, InteractiveModeContext } from "../../mode
 import {
 	BACKGROUND_TAN_DISPATCH_MESSAGE_TYPE,
 	type CustomMessage,
-	isSilentAbort,
 	LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE,
-	resolveAbortLabel,
 	SKILL_PROMPT_MESSAGE_TYPE,
 	type SkillPromptDetails,
 } from "../../session/messages";
 import type { SessionContext } from "../../session/session-context";
-import { createIrcMessageCard } from "../../tools/irc";
-import { formatBytes, formatDuration } from "../../tools/render-utils";
-import { canonicalizeMessage } from "../../utils/thinking-display";
+import { buildSkillCommandPrompt, invokeSkillCommandFromText, isKnownSkillCommand } from "../skill-command";
+import { createAssistantMessageComponent } from "./interactive-context-helpers";
+import {
+	assistantHasVisibleContent,
+	buildAsyncResultBlock,
+	buildFileMentionBlock,
+	buildIrcMessageCard,
+	normalizeToolArgs,
+	resolveAssistantErrorMessage,
+} from "./transcript-render-helpers";
 
 type TextBlock = { type: "text"; text: string };
 interface RenderInitialMessagesOptions {
@@ -142,47 +149,7 @@ export class UiHelpers {
 			case "custom": {
 				if (message.display) {
 					if (message.customType === "async-result") {
-						const details = (
-							message as CustomMessage<{
-								jobId?: string;
-								type?: "bash" | "task";
-								label?: string;
-								durationMs?: number;
-								jobs?: Array<{
-									jobId?: string;
-									type?: "bash" | "task";
-									label?: string;
-									durationMs?: number;
-								}>;
-							}>
-						).details;
-						const jobs =
-							details?.jobs && details.jobs.length > 0
-								? details.jobs
-								: [
-										{
-											jobId: details?.jobId,
-											type: details?.type,
-											label: details?.label,
-											durationMs: details?.durationMs,
-										},
-									];
-						const block = new TranscriptBlock();
-						for (const job of jobs) {
-							const jobId = job.jobId ?? "unknown";
-							const typeLabel = job.type ? `[${job.type}]` : "[job]";
-							const duration = typeof job.durationMs === "number" ? formatDuration(job.durationMs) : undefined;
-							const line = [
-								theme.fg("success", `${theme.status.done} Background job completed`),
-								theme.fg("dim", typeLabel),
-								theme.fg("accent", jobId),
-								duration ? theme.fg("dim", `(${duration})`) : undefined,
-							]
-								.filter(Boolean)
-								.join(" ");
-							block.addChild(new Text(line, 1, 0));
-						}
-						this.ctx.chatContainer.addChild(block);
+						this.ctx.chatContainer.addChild(buildAsyncResultBlock(message));
 						break;
 					}
 					if (message.customType === LSP_LATE_DIAGNOSTIC_MESSAGE_TYPE) {
@@ -212,33 +179,7 @@ export class UiHelpers {
 						message.customType === "irc:autoreply" ||
 						message.customType === "irc:relay"
 					) {
-						const details = (
-							message as CustomMessage<{
-								from?: string;
-								to?: string;
-								message?: string;
-								body?: string;
-								replyTo?: string;
-							}>
-						).details;
-						const kind =
-							message.customType === "irc:incoming"
-								? ("incoming" as const)
-								: message.customType === "irc:autoreply"
-									? ("autoreply" as const)
-									: ("relay" as const);
-						const card = createIrcMessageCard(
-							{
-								kind,
-								from: details?.from,
-								to: details?.to,
-								body: kind === "incoming" ? details?.message : details?.body,
-								replyTo: details?.replyTo,
-								timestamp: message.timestamp,
-							},
-							() => this.ctx.toolOutputExpanded,
-							theme,
-						);
+						const card = buildIrcMessageCard(message, () => this.ctx.toolOutputExpanded);
 						this.ctx.chatContainer.addChild(card);
 						return [card];
 					}
@@ -283,25 +224,7 @@ export class UiHelpers {
 			}
 			case "fileMention": {
 				// Render compact file mention display
-				const block = new TranscriptBlock();
-				for (const file of message.files) {
-					let suffix: string;
-					if (file.skippedReason === "tooLarge") {
-						const size = typeof file.byteSize === "number" ? formatBytes(file.byteSize) : "unknown size";
-						suffix = `(skipped: ${size})`;
-					} else {
-						suffix = file.image
-							? "(image)"
-							: file.lineCount === undefined
-								? "(unknown lines)"
-								: `(${file.lineCount} lines)`;
-					}
-					const text = `${theme.fg("dim", `${theme.tree.last} `)}${theme.fg("muted", "Read")} ${theme.fg(
-						"accent",
-						file.path,
-					)} ${theme.fg("dim", suffix)}`;
-					block.addChild(new Text(text, 0, 0));
-				}
+				const block = buildFileMentionBlock(message.files, 0);
 				if (block.children.length > 0) this.ctx.chatContainer.addChild(block);
 				break;
 			}
@@ -325,13 +248,7 @@ export class UiHelpers {
 				break;
 			}
 			case "assistant": {
-				const assistantComponent = new AssistantMessageComponent(
-					message,
-					this.ctx.hideThinkingBlock,
-					() => this.ctx.ui.requestRender(),
-					this.ctx.viewSession.extensionRunner?.getAssistantThinkingRenderers(),
-					this.ctx.ui.imageBudget,
-				);
+				const assistantComponent = createAssistantMessageComponent(this.ctx, message);
 				this.ctx.chatContainer.addChild(assistantComponent);
 				break;
 			}
@@ -358,6 +275,9 @@ export class UiHelpers {
 	): void {
 		// Preserved: message_start handler owns this lifecycle (see #783)
 		this.ctx.pendingTools.clear();
+		// Reseed the cache-invalidation baseline: this rebuild re-derives every
+		// turn's marker from usage, and the last turn becomes the live baseline.
+		this.ctx.lastAssistantUsage = undefined;
 
 		if (options.updateFooter) {
 			this.ctx.statusLine.invalidate();
@@ -399,18 +319,46 @@ export class UiHelpers {
 			// updateResult armed.
 			previous.seal();
 		};
-		for (const message of sessionContext.messages) {
+		let todoSnapshot: ToolExecutionComponent | null = null;
+		const resolveTodoSnapshot = (nextToolName?: string) => {
+			const previous = todoSnapshot;
+			if (!previous) return;
+			if (!previous.isDisplaceableBlock()) {
+				todoSnapshot = null;
+				return;
+			}
+			if (previous.canBeDisplacedBy(nextToolName)) {
+				todoSnapshot = null;
+				this.ctx.chatContainer.removeChild(previous);
+				previous.seal();
+				return;
+			}
+			if (nextToolName !== undefined) return;
+			todoSnapshot = null;
+			previous.seal();
+		};
+		const messages = sessionContext.messages;
+		const count = messages.length;
+		for (let i = 0; i < count; i++) {
+			const message = messages[i]!;
 			if (message.role !== "toolResult") flushPendingUsage();
 			// Assistant messages need special handling for tool calls
 			if (message.role === "assistant") {
 				this.ctx.addMessageToChat(message);
 				const lastChild = this.ctx.chatContainer.children[this.ctx.chatContainer.children.length - 1];
 				const assistantComponent = lastChild instanceof AssistantMessageComponent ? lastChild : undefined;
-				const hasVisibleAssistantContent = message.content.some(
-					content =>
-						(content.type === "text" && canonicalizeMessage(content.text)) ||
-						(content.type === "thinking" && canonicalizeMessage(content.thinking)),
-				);
+				if (assistantComponent) {
+					const usage = message.usage;
+					const explained = sessionContext.cacheMissExplainedAt?.[i] ?? false;
+					if (this.ctx.settings.get("display.cacheMissMarker") && !explained) {
+						const invalidation = detectCacheInvalidation(this.ctx.lastAssistantUsage, usage);
+						if (invalidation) assistantComponent.setCacheInvalidation(invalidation);
+					}
+					if (usage.cacheRead + usage.cacheWrite + usage.input > 0) {
+						this.ctx.lastAssistantUsage = usage;
+					}
+				}
+				const hasVisibleAssistantContent = assistantHasVisibleContent(message);
 				if (hasVisibleAssistantContent) {
 					// Rebuild reconstructs immutable history; seal (not finalize) so the
 					// group freezes even if a read's result was never persisted —
@@ -419,14 +367,10 @@ export class UiHelpers {
 					readGroup?.seal();
 					readGroup = null;
 				}
-				const isAbortedSilently = message.stopReason === "aborted" && isSilentAbort(message.errorMessage);
-				const hasErrorStop =
-					!isAbortedSilently && (message.stopReason === "aborted" || message.stopReason === "error");
-				const errorMessage = hasErrorStop
-					? message.stopReason === "aborted"
-						? resolveAbortLabel(message.errorMessage, this.ctx.viewSession.retryAttempt)
-						: message.errorMessage || "Error"
-					: null;
+				const { hasErrorStop, errorMessage } = resolveAssistantErrorMessage(
+					message,
+					this.ctx.viewSession.retryAttempt,
+				);
 
 				// Render tool call components
 				for (const content of message.content) {
@@ -455,10 +399,7 @@ export class UiHelpers {
 								content.id,
 							);
 						} else {
-							const normalizedArgs =
-								content.arguments && typeof content.arguments === "object" && !Array.isArray(content.arguments)
-									? (content.arguments as Record<string, unknown>)
-									: {};
+							const normalizedArgs = normalizeToolArgs(content.arguments);
 							readToolCallArgs.set(content.id, normalizedArgs);
 							if (assistantComponent) {
 								readToolCallAssistantComponents.set(content.id, assistantComponent);
@@ -470,10 +411,10 @@ export class UiHelpers {
 					readGroup?.seal();
 					readGroup = null;
 					const tool = this.ctx.viewSession.getToolByName(content.name);
-					const renderArgs =
-						"partialJson" in content
-							? { ...content.arguments, __partialJson: content.partialJson }
-							: content.arguments;
+					const partialJson = getStreamingPartialJson(content);
+					const renderArgs = partialJson
+						? { ...content.arguments, __partialJson: partialJson }
+						: content.arguments;
 					const component = new ToolExecutionComponent(
 						content.name,
 						renderArgs,
@@ -556,11 +497,22 @@ export class UiHelpers {
 						component.isDisplaceableBlock()
 					) {
 						waitingPoll = component;
+					} else if (
+						message.toolName === "todo" &&
+						component instanceof ToolExecutionComponent &&
+						component.canBeDisplacedBy("todo")
+					) {
+						// A successful todo result supersedes the prior live snapshot. Failed
+						// follow-ups return false from canBeDisplacedBy("todo"), so the
+						// last-good panel stays on screen.
+						resolveTodoSnapshot("todo");
+						todoSnapshot = component;
 					}
 				}
 			} else {
 				// A user prompt closes the displacement window, same as the live path.
 				if (message.role === "user") resolveWaitingPoll();
+				if (message.role === "user") resolveTodoSnapshot();
 				// All other messages use standard rendering
 				this.ctx.addMessageToChat(message, options);
 			}
@@ -574,6 +526,17 @@ export class UiHelpers {
 		// A trailing waiting poll is final history on rebuild; seal it so it
 		// freezes (and its spinner timer stops) like every other block.
 		resolveWaitingPoll();
+		// A trailing todo snapshot is live state, not history: when the rebuild
+		// runs mid-turn (settings overlay close, focus attach during streaming),
+		// hand it back to the controller so a follow-up `todo` update keeps
+		// displacing instead of stacking. Idle rebuilds (resume / compaction)
+		// fall through to the seal path so the snapshot freezes as history.
+		if (todoSnapshot && this.ctx.session?.isStreaming) {
+			this.ctx.eventController?.inheritDisplaceableTodo(todoSnapshot);
+			todoSnapshot = null;
+		} else {
+			resolveTodoSnapshot();
+		}
 
 		this.ctx.pendingTools.clear();
 		this.ctx.ui.requestRender();
@@ -586,6 +549,7 @@ export class UiHelpers {
 		// dispose them (stopping any live timers/subscriptions) before clearing. When
 		// preserving, the same instances are re-added below, so detach without dispose.
 		const preservedChatChildren = options.preserveExistingChat ? this.ctx.chatContainer.children : undefined;
+		this.ctx.initialChatRendered = true;
 		if (preservedChatChildren) {
 			this.ctx.chatContainer.clear();
 		} else {
@@ -595,9 +559,9 @@ export class UiHelpers {
 		this.ctx.pendingBashComponents = [];
 		this.ctx.pendingPythonComponents = [];
 
-		// Display always uses the full-history transcript: compactions show as
-		// inline dividers instead of restarting the visible conversation.
-		const context = this.ctx.viewSession.buildTranscriptSessionContext();
+		// Live display uses the compacted transcript tail; export/resume callers
+		// can still request the full inline compaction history.
+		const context = this.ctx.viewSession.buildTranscriptSessionContext({ collapseCompactedHistory: true });
 		this.ctx.renderSessionContext(context, {
 			updateFooter: true,
 			populateHistory: !this.ctx.focusedAgentId,
@@ -627,10 +591,7 @@ export class UiHelpers {
 	}
 
 	clearEditor(): void {
-		this.ctx.editor.setText("");
-		this.ctx.pendingImages = [];
-		this.ctx.pendingImageLinks = [];
-		this.ctx.editor.imageLinks = undefined;
+		this.ctx.editor.clearDraft();
 		this.ctx.ui.requestRender();
 	}
 
@@ -699,11 +660,7 @@ export class UiHelpers {
 	queueCompactionMessage(text: string, mode: "steer" | "followUp", images?: ImageContent[]): void {
 		const queuedImages = images && images.length > 0 ? images : undefined;
 		this.ctx.compactionQueuedMessages.push({ text, mode, images: queuedImages } as CompactionQueuedMessage);
-		this.ctx.editor.addToHistory(text);
-		this.ctx.editor.setText("");
-		this.ctx.editor.imageLinks = undefined;
-		this.ctx.pendingImages = [];
-		this.ctx.pendingImageLinks = [];
+		this.ctx.editor.clearDraft(text);
 		this.ctx.updatePendingMessagesDisplay();
 		this.ctx.showStatus(
 			queuedImages ? "Queued message with image for after compaction" : "Queued message for after compaction",
@@ -711,6 +668,15 @@ export class UiHelpers {
 	}
 
 	async #deliverQueuedMessage(message: CompactionQueuedMessage): Promise<void> {
+		if (
+			await invokeSkillCommandFromText(this.ctx, message.text, message.mode, {
+				propagateErrors: true,
+				queueOnly: true,
+				images: message.images,
+			})
+		) {
+			return;
+		}
 		if (this.ctx.isKnownSlashCommand(message.text)) {
 			await this.ctx.session.prompt(message.text);
 			return;
@@ -798,29 +764,37 @@ export class UiHelpers {
 				await this.#deliverQueuedMessage(message);
 			}
 
-			// Pass streamingBehavior so that if the session is still streaming when
-			// compaction-end fires (race window between isStreaming flipping false and
-			// the event landing here), prompt() routes the message into the steer/
-			// follow-up queue instead of throwing AgentBusyError. When the session is
-			// genuinely idle, streamingBehavior is ignored and a fresh prompt runs as
-			// before. This keeps the steer preview honest: if delivery has to be
-			// deferred, the message lands in the same queue every other consumer
-			// (Alt+Up dequeue, post-stream drain) already drains, instead of being
-			// stranded in compactionQueuedMessages with no drainer.
-			//
-			// firstPrompt is fire-and-forget — its rejection is funneled through
-			// `restoreQueue` rather than rethrown, so we use the primitive
-			// recordLocalSubmission and dispose manually in the catch.
-			const disposeFirstPrompt = this.ctx.recordLocalSubmission(firstPrompt.text, firstPrompt.images?.length ?? 0);
-			const promptPromise = this.ctx.session
-				.prompt(firstPrompt.text, {
-					streamingBehavior: firstPrompt.mode === "followUp" ? "followUp" : "steer",
-					images: firstPrompt.images,
-				})
-				.catch((error: unknown) => {
-					disposeFirstPrompt();
-					restoreQueue(error);
-				});
+			// First prompt is fire-and-forget — its rejection is funneled through
+			// `restoreQueue` rather than rethrown. Plain prompts use primitive
+			// recordLocalSubmission and dispose manually in the catch. Skill prompts
+			// are rebuilt as user-attributed custom messages so queued `/skill:` text
+			// is not sent as a literal prompt after compaction.
+			let promptPromise: Promise<unknown>;
+			if (isKnownSkillCommand(this.ctx, firstPrompt.text)) {
+				const built = await buildSkillCommandPrompt(
+					this.ctx,
+					firstPrompt.text,
+					firstPrompt.mode,
+					firstPrompt.images,
+				);
+				promptPromise = built
+					? this.ctx.session.promptCustomMessage(built.message, built.options).catch(restoreQueue)
+					: Promise.resolve();
+			} else {
+				const disposeFirstPrompt = this.ctx.recordLocalSubmission(
+					firstPrompt.text,
+					firstPrompt.images?.length ?? 0,
+				);
+				promptPromise = this.ctx.session
+					.prompt(firstPrompt.text, {
+						streamingBehavior: firstPrompt.mode === "followUp" ? "followUp" : "steer",
+						images: firstPrompt.images,
+					})
+					.catch((error: unknown) => {
+						disposeFirstPrompt();
+						restoreQueue(error);
+					});
+			}
 
 			for (const message of rest) {
 				await this.#deliverQueuedMessage(message);

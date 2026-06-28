@@ -1,5 +1,7 @@
 import { logger } from "@oh-my-pi/pi-utils";
+import { type } from "arktype";
 import { captureRequestHeaders, resolvePromptCacheKey } from "../auth-gateway/http";
+import * as AIError from "../error";
 import type {
 	AssistantMessage,
 	AssistantMessageEventStream,
@@ -203,7 +205,10 @@ function walkAssistantContent(
 					type: "toolCall",
 					id: block.id,
 					name: block.name,
-					arguments: block.input ?? {},
+					arguments:
+						block.input && typeof block.input === "object" && !Array.isArray(block.input)
+							? (block.input as Record<string, unknown>)
+							: {},
 				});
 				break;
 			default: {
@@ -287,11 +292,10 @@ function deriveCacheRetention(data: {
 }
 
 export function parseRequest(body: unknown, headers?: Headers): ParsedRequest {
-	const parsed = anthropicMessagesRequestSchema.safeParse(body);
-	if (!parsed.success) {
-		throw new Error(`anthropic-messages: ${parsed.error.message}`);
+	const data = anthropicMessagesRequestSchema(body);
+	if (data instanceof type.errors) {
+		throw new AIError.ValidationError(`anthropic-messages: ${data.summary}`);
 	}
-	const data = parsed.data;
 
 	const now = Date.now();
 	const messages: Message[] = [];
@@ -454,7 +458,13 @@ function encodeUsage(message: AssistantMessage): Record<string, unknown> {
 
 export function encodeResponse(message: AssistantMessage, requestedModelId: string): Record<string, unknown> {
 	if (message.stopReason === "error" || message.stopReason === "aborted") {
-		throw new Error(message.errorMessage ?? `anthropic-messages: upstream ${message.stopReason}`);
+		throw new AIError.ProviderResponseError(
+			message.errorMessage ?? `anthropic-messages: upstream ${message.stopReason}`,
+			{
+				provider: "anthropic",
+				kind: "output",
+			},
+		);
 	}
 	return {
 		id: message.responseId ?? newMessageId(),

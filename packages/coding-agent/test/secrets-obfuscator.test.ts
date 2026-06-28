@@ -393,6 +393,27 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(obfuscator.obfuscate(obfuscated)).toBe(obfuscated);
 	});
 
+	it("skips sub-threshold obfuscate regex matches that straddle a generated placeholder", () => {
+		// `[A-Z]{6}` only ever matches 6 chars — below MIN_OBFUSCATE_SECRET_LEN — but
+		// when a match overlaps the plain secret's placeholder its range is extended
+		// across the whole `#…#` token. Guarding on that rewritten span (instead of
+		// the regex's own match length) let the short match re-placeholder across the
+		// token and corrupt round-trip deobfuscation (e.g. "XXSECRETUVYY" dropping to
+		// "XXSECRETUV"). The plain secret must stay hidden, the surrounding literals
+		// must survive, and the round trip must be exact.
+		const obfuscator = new SecretObfuscator([
+			{ type: "plain", content: "SECRETUV" },
+			{ type: "regex", content: "[A-Z]{6}" },
+		]);
+
+		const obfuscated = obfuscator.obfuscate("XXSECRETUVYY");
+
+		expect(obfuscated).not.toContain("SECRETUV");
+		expect(obfuscated.startsWith("XX")).toBe(true);
+		expect(obfuscated.endsWith("YY")).toBe(true);
+		expect(obfuscator.deobfuscate(obfuscated)).toBe("XXSECRETUVYY");
+	});
+
 	it("keeps regex placeholders stable when inner friendly names change", () => {
 		const sharedKey = "E".repeat(43);
 		const before = new SecretObfuscator(

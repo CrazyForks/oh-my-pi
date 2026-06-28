@@ -627,8 +627,16 @@ export class SecretObfuscator {
 						origin = replaceRange(origin, match.start, match.end, obfuscated.origin);
 						continue;
 					}
-					if (match.value.length < MIN_OBFUSCATE_SECRET_LEN) {
-						// Tone down short regex match obfuscation to avoid false matches on small words/fragments
+					if (match.scanMatchLength < MIN_OBFUSCATE_SECRET_LEN) {
+						// Tone down short regex match obfuscation to avoid false matches on
+						// small words/fragments. Measure the regex's own match length in the
+						// canonical (placeholder-expanded) scan view, not the rewritten
+						// source span: a match that straddles an already-emitted `#…#` token
+						// has its range extended to cover the whole token, so both the source
+						// span and the expanded canonical overstate how much content the
+						// regex actually matched. Without this a sub-threshold match could
+						// slip through and re-placeholder across the token, corrupting
+						// round-trip deobfuscation.
 						continue;
 					}
 					// obfuscate mode — get or create stable index
@@ -964,6 +972,7 @@ export class SecretObfuscator {
 		end: number;
 		value: string;
 		canonicalValue: string;
+		scanMatchLength: number;
 		recursive: boolean;
 		preserveGeneratedPlaceholders: boolean;
 		preserveInputPlaceholders: boolean;
@@ -981,6 +990,7 @@ export class SecretObfuscator {
 			end: number;
 			value: string;
 			canonicalValue: string;
+			scanMatchLength: number;
 			recursive: boolean;
 			preserveGeneratedPlaceholders: boolean;
 			preserveInputPlaceholders: boolean;
@@ -998,6 +1008,7 @@ export class SecretObfuscator {
 			}
 			let start = match.index;
 			let end = match.index + match[0].length;
+			const scanMatchLength = match[0].length;
 			let canonicalValue = "";
 			let recursive = false;
 			let preserveGeneratedPlaceholders = false;
@@ -1070,6 +1081,7 @@ export class SecretObfuscator {
 				end,
 				value: text.slice(start, end),
 				canonicalValue,
+				scanMatchLength,
 				recursive,
 				preserveGeneratedPlaceholders,
 				preserveInputPlaceholders,

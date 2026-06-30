@@ -1,5 +1,5 @@
 import type { Effort } from "@oh-my-pi/pi-catalog/effort";
-import { supportsAllTurnsReasoningContext } from "@oh-my-pi/pi-catalog/identity";
+import { supportsAllTurnsReasoningContext, supportsReasoningSummary } from "@oh-my-pi/pi-catalog/identity";
 import { requireSupportedEffort } from "@oh-my-pi/pi-catalog/model-thinking";
 import type { Api, Model } from "../../types";
 
@@ -85,7 +85,13 @@ function getReasoningConfig(model: Model<Api>, options: CodexRequestOptions): Re
 		effort:
 			options.reasoningEffort === "none" ? "none" : requireSupportedEffort(model, options.reasoningEffort as Effort),
 	};
-	if (options.reasoningSummary !== null) {
+	// `reasoning.summary` is universally honored across Codex Responses ids
+	// EXCEPT gpt-5.3-codex-spark, which rejects it with
+	// `Unsupported parameter: 'reasoning.summary' is not supported with this
+	// model` and aborts the turn (no retry). For Spark, omit `summary`
+	// regardless of caller intent; for everything else, keep the prior
+	// behavior (null → omit, value → forward, undefined → "detailed").
+	if (options.reasoningSummary !== null && supportsReasoningSummary(model.id)) {
 		config.summary = options.reasoningSummary ?? "detailed";
 	}
 	return config;

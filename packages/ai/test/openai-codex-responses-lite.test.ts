@@ -147,6 +147,61 @@ describe("openai-codex reasoning.context", () => {
 	});
 });
 
+describe("openai-codex reasoning.summary", () => {
+	it("attaches the default summary on supported Codex models", async () => {
+		const model = createCodexModel("gpt-5.4-codex");
+
+		const body = await transformRequestBody({ model: model.id }, model, { reasoningEffort: "medium" });
+		expect(body.reasoning?.summary).toBe("detailed");
+	});
+
+	it("forwards an explicit reasoningSummary on supported Codex models", async () => {
+		const model = createCodexModel("gpt-5.3-codex");
+
+		const body = await transformRequestBody({ model: model.id }, model, {
+			reasoningEffort: "medium",
+			reasoningSummary: "concise",
+		});
+		expect(body.reasoning?.summary).toBe("concise");
+	});
+
+	// gpt-5.3-codex-spark rejects reasoning.summary with
+	// "Unsupported parameter: 'reasoning.summary' is not supported with the
+	// 'gpt-5.3-codex-spark' model" — and the error is terminal (the unrelated
+	// reasoning-param case in openai-reasoning-effort-fallback.test.ts confirms
+	// no retry), so the field MUST NOT be attached.
+	it("omits reasoning.summary for gpt-5.3-codex-spark by default", async () => {
+		const model = createCodexModel("gpt-5.3-codex-spark");
+
+		const body = await transformRequestBody({ model: model.id }, model, { reasoningEffort: "medium" });
+		expect(body.reasoning).toBeDefined();
+		expect(body.reasoning?.summary).toBeUndefined();
+		expect("summary" in (body.reasoning ?? {})).toBe(false);
+	});
+
+	it("suppresses an explicit reasoningSummary override on gpt-5.3-codex-spark", async () => {
+		const model = createCodexModel("gpt-5.3-codex-spark");
+
+		const forced = await transformRequestBody({ model: model.id }, model, {
+			reasoningEffort: "medium",
+			reasoningSummary: "concise",
+		});
+		expect(forced.reasoning).toBeDefined();
+		expect(forced.reasoning?.summary).toBeUndefined();
+	});
+
+	it("still omits reasoning.summary when the caller explicitly passes null", async () => {
+		const model = createCodexModel("gpt-5.4-codex");
+
+		const body = await transformRequestBody({ model: model.id }, model, {
+			reasoningEffort: "medium",
+			reasoningSummary: null,
+		});
+		expect(body.reasoning).toBeDefined();
+		expect(body.reasoning?.summary).toBeUndefined();
+	});
+});
+
 describe("openai-codex Responses Lite input shaping", () => {
 	it("keeps full Responses image details when a requested lite body contains images", async () => {
 		const model = createCodexModel("gpt-5.1-codex");

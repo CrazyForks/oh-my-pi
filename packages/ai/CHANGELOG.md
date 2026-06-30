@@ -6,6 +6,7 @@
 
 - Raised Gemini header runaway threshold to prevent premature interruption of complex reasoning loops
 - Fixed leaked ` ```thinking ` fences with nested language-tagged Markdown code blocks so inner fences remain inside structured thinking instead of leaking as visible reply text.
+- Fixed Codex Responses unconditionally attaching `reasoning.summary` for `gpt-5.3-codex-spark`, which the ChatGPT backend rejects with `Unsupported parameter: 'reasoning.summary' is not supported with this model`, aborting the agent turn ([#3928](https://github.com/can1357/oh-my-pi/issues/3928)).
 
 ## [16.2.9] - 2026-06-30
 

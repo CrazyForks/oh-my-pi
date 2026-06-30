@@ -16,6 +16,10 @@
 - Updated the base API URL for the Claude Sonnet 5 model in the Anthropic catalog
 - Updated pricing metrics for DeepSeek R1 and DeepSeek V3 model entries to reflect new rates
 
+### Fixed
+
+- Added `supportsReasoningSummary` identity predicate, letting Codex Responses omit `reasoning.summary` for `gpt-5.3-codex-spark`, which the ChatGPT backend rejects ([#3928](https://github.com/can1357/oh-my-pi/issues/3928)).
+
 ## [16.2.9] - 2026-06-30
 
 ### Added

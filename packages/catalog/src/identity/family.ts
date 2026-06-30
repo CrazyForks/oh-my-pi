@@ -140,6 +140,25 @@ export const supportsAllTurnsReasoningContext = memo((modelId: string): boolean 
 });
 
 /**
+ * OpenAI Codex models that accept `reasoning.summary` in the request.
+ *
+ * The field is universally honored across gpt-5/o-series Responses ids EXCEPT
+ * `gpt-5.3-codex-spark`, which rejects it with
+ * `Unsupported parameter: 'reasoning.summary' is not supported with the
+ * 'gpt-5.3-codex-spark' model` and aborts the turn (no retry — the fallback
+ * matrix in `openai-reasoning-effort-fallback.test.ts` treats unrelated
+ * `reasoning.summary` errors as terminal). Sibling to
+ * `supportsAllTurnsReasoningContext`. Gated narrowly to the `codex-spark`
+ * variant — non-Spark Codex ids are unaffected; widen if another id is
+ * observed rejecting the field.
+ */
+export const supportsReasoningSummary = memo((modelId: string): boolean => {
+	const parsed = parseOpenAIModel(bareModelId(modelId));
+	if (!parsed) return true;
+	return parsed.variant !== "codex-spark";
+});
+
+/**
  * Reasoning-capable GLM coding SKUs: glm-4.5 and up on the base / `-air` /
  * `-turbo` lines. Excludes the vision (`…v`) shape, the non-reasoning
  * `-flash`/`-flashx`/`-preview` variants, and pre-4.5 ids. Matching the family

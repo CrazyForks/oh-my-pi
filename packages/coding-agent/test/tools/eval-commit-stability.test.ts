@@ -24,13 +24,7 @@ import type { TUI } from "@oh-my-pi/pi-tui";
 const uiStub = { requestRender() {} } as unknown as TUI;
 
 function makeEvalComponent() {
-	return new ToolExecutionComponent(
-		"eval",
-		{ language: "py", code: "print('hi')" },
-		{},
-		undefined,
-		uiStub,
-	);
+	return new ToolExecutionComponent("eval", { language: "py", code: "print('hi')" }, {}, undefined, uiStub);
 }
 
 function partialResult(text: string) {
@@ -69,13 +63,7 @@ describe("eval tool block commit stability", () => {
 	it("does not opt other foreground tools out of partial-result stream commits", () => {
 		// Sanity: bash and friends still get the existing `isPartial`
 		// commit-stable behaviour — the eval opt-in must be renderer-scoped.
-		const component = new ToolExecutionComponent(
-			"bash",
-			{ command: "ls" },
-			{},
-			undefined,
-			uiStub,
-		);
+		const component = new ToolExecutionComponent("bash", { command: "ls" }, {}, undefined, uiStub);
 		component.updateResult(partialResult("a\nb\n"), true);
 
 		expect(component.isTranscriptBlockFinalized()).toBe(false);

@@ -295,6 +295,11 @@ export interface ExecutorOptions {
 	parentActiveModelPattern?: string;
 	thinkingLevel?: ThinkingLevel;
 	outputSchema?: unknown;
+	/**
+	 * Caller supplied a schema that supersedes the agent's native output prompt.
+	 * Eval `agent(..., schema=...)` sets this so built-in agents ignore stale yield labels.
+	 */
+	outputSchemaOverridesAgent?: boolean;
 	/** Parent task recursion depth (0 = top-level, 1 = first child, etc.) */
 	taskDepth?: number;
 	/**
@@ -2139,6 +2144,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 						planReferencePath: options.planReference?.path ?? "",
 						worktree: worktree ?? "",
 						outputSchema: normalizedOutputSchema,
+						outputSchemaOverridesAgent: options.outputSchemaOverridesAgent === true,
 						ircPeers: ircEnabled ? renderIrcPeerRoster(id) : "",
 						ircSelfId: ircEnabled ? id : "",
 					});
@@ -2313,7 +2319,7 @@ export async function runSubprocess(options: ExecutorOptions): Promise<SingleRes
 			// Autoload skills via sendCustomMessage (same mechanic as /skill:<name>)
 			if (options.autoloadSkills?.length) {
 				for (const skill of options.autoloadSkills) {
-					const { message } = await buildSkillPromptMessage(skill, "");
+					const { message } = await buildSkillPromptMessage(skill, "", "autoload");
 					await session.sendCustomMessage(
 						{
 							customType: SKILL_PROMPT_MESSAGE_TYPE,

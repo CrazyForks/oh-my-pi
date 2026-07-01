@@ -407,6 +407,15 @@ export interface CreateAgentSessionOptions {
 	customSystemPrompt?: string;
 	/** Already-loaded text appended through the bundled system prompt templates. */
 	appendSystemPrompt?: string;
+	/**
+	 * Already-loaded title-generation system prompt override (typically
+	 * {@link discoverTitleSystemPromptFile} → {@link resolvePromptInput}). When
+	 * set, every automatic session-title generation path on this session — the
+	 * first-input title and the replan-driven refresh — uses this prompt
+	 * instead of the bundled default. Refresh on cwd change via
+	 * {@link AgentSession.setTitleSystemPrompt}.
+	 */
+	titleSystemPrompt?: string;
 	/** Optional provider-facing session identifier for prompt caches and sticky auth selection.
 	 * Keeps persisted session files isolated while reusing provider-side caches. */
 	providerSessionId?: string;
@@ -1280,7 +1289,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			? getRestorableSessionModels(existingSession.models, sessionManager.getLastModelChangeRole())
 			: [];
 	let restoredSessionModelIndex = -1;
-	let restoredSessionThinkingLevel: ThinkingLevel | undefined;
+	let restoredSessionThinkingLevel: ConfiguredThinkingLevel | undefined;
 	if (!hasExplicitModel && !model && sessionModelStrings.length > 0) {
 		logger.time("restoreSessionModel", () => {
 			let failedSessionModel: string | undefined;
@@ -1288,6 +1297,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				const sessionModelStr = sessionModelStrings[i];
 				const parsedModel = parseModelString(sessionModelStr, {
 					allowMaxAlias: true,
+					allowAutoAlias: true,
 					isLiteralModelId: (provider, id) => modelRegistry.find(provider, id) !== undefined,
 				});
 				if (!parsedModel) {
@@ -1938,6 +1948,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 				const sessionModelStr = sessionModelStrings[i];
 				const parsedModel = parseModelString(sessionModelStr, {
 					allowMaxAlias: true,
+					allowAutoAlias: true,
 					isLiteralModelId: (provider, id) => modelRegistry.find(provider, id) !== undefined,
 				});
 				if (!parsedModel) continue;
@@ -2766,6 +2777,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			providerSessionId: options.providerSessionId,
 			parentEvalSessionId: options.parentEvalSessionId,
 			advisorTools,
+			titleSystemPrompt: options.titleSystemPrompt,
 		});
 		hasSession = true;
 		if (asyncJobManager) {

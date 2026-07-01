@@ -20,6 +20,57 @@
 - Fixed a secret regex whose match straddles a previously generated `#…#` placeholder still rewriting short surrounding raw bytes the regex never needed, drifting the `obfuscate()` fixed point and provider-visible history/prompt-cache prefixes across re-obfuscation passes. When a greedy match (e.g. `[A-Z0-9]{8,12}`) reaches across a prior-call placeholder whose own value already satisfies the pattern, a trailing/leading raw chunk that does not independently match is now left verbatim instead of being rewritten on the next pass — in obfuscate mode the chunk was minted into a fresh placeholder (`…SECRETUV→#…#A`), and in default replace mode its deterministic scramble drifted (`…#…#ZZJ5sotJ` → `…#…#ZZpvsotJ`). Surrounding bytes are still redacted when the placeholder value alone cannot satisfy the regex (e.g. a required `api_key=` prefix) or when they independently match it ([#2465](https://github.com/can1357/oh-my-pi/issues/2465)).
 - Fixed a secret regex match straddling a prior-call placeholder with independently-matching raw bytes on one or both sides leaking those bytes unredacted, in two ways. First, the spillover check concatenated the outside-placeholder chunks before testing whether they independently satisfy the regex, which erased the placeholder-token boundary between them — e.g. with `\b[A-Z]{8}\b|[A-Z]{17}` and a placeholder for `SECRETUV` flanked by prefix `ABCDEFGH` (matches on its own) and suffix `I` (does not), the concatenated `ABCDEFGHI` matched neither alternative, so `ABCDEFGH` was treated as spillover and left verbatim. Second, testing each chunk in isolation (an out-of-context substring) broke context-sensitive patterns — lookbehind, lookahead, and `\b` — that depend on bytes actually adjacent to the chunk in the source text but outside its own range: `(?<=api=)[0-9]{8}` over `api=12345678` plus a trailing placeholder failed when `12345678` was tested standalone, since the isolated slice has no `api=` immediately before it. Each outside chunk is now tested at its real position in the source text, so lookbehind/lookahead see the actual surrounding bytes while a match spanning into the placeholder itself still doesn't count as independent.
 
+### Changed
+
+- Optimized session loading and rendering performance, including a 10x speedup for smooth streaming reveals on large messages, 35% faster session resumes for large files using native streaming JSONL parsing, and reduced overhead for edit-patch fallbacks.
+- Improved TUI responsiveness and reduced CPU usage during long-running tool sessions by throttling status-line redraws and optimizing subagent persistence checks.
+- Updated the advisor system prompt and documentation to accurately reflect WATCHDOG.yml tool grants.
+- Improved DuckDuckGo web search error clarity and documented datacenter/shared-egress limitations in provider settings.
+
+### Fixed
+
+- Fixed the apply_patch tool to prevent silently overwriting pre-existing files during creation or renaming, rejecting upfront with an error instead.
+- Fixed multi-file apply_patch to stop at the first failing file, surface applied vs. skipped paths, and correctly report the error to the agent loop.
+- Fixed process termination (SIGTERM, SIGHUP, uncaught exceptions) skipping editor draft saves, session shutdown events, and background job cleanup.
+- Fixed /quit and /exit commands blocking session closure by introducing a shutdown budget and backgrounding remaining tasks.
+- Fixed git and GitHub CLI subprocesses hanging on interactive prompts by forcing non-interactive environments, adding timeouts, and capping output.
+- Fixed RPC mode abort_bash being blocked by running bash commands by dispatching bash in the background.
+- Fixed task.maxConcurrency and task.maxRecursionDepth limits being bypassed by sub-spawn paths, ensuring limits are dynamically resized and respected.
+- Fixed the edit tool inflating session files by pruning extremely large file snapshots from tool-result details.
+- Fixed workstation OS detection rendering "Kernel: unknown" on macOS 15+.
+- Fixed /copy code and /copy cmd commands being treated as normal prompts instead of copying the requested blocks.
+- Fixed interactive bash status line not updating after directory changes (cd).
+- Fixed session title refreshes ignoring user TITLE_SYSTEM.md overrides during replans, and prevented auto-generated titles from incorrectly preserving all-caps text from user messages.
+- Fixed the live todo HUD going stale during long tool-use loops by adding mid-run reminders for incomplete items.
+- Fixed /shake and mid-stream chat rebuilds erasing active LLM output.
+- Fixed RpcClient failing to restart after being stopped or failing on initial startup.
+- Fixed /collab web guests being unable to answer ask tool questions by routing host UI requests through writable collab peers.
+- Fixed search and AST tools accepting external read URLs by materializing fetched URL text through the read cache before path resolution.
+- Fixed Tavily web search to retry without recency filters if no content is returned.
+- Fixed extension validation failures for omp install pi-lean-ctx by exposing legacy tool factories.
+- Fixed visibility of the focused option in the multi-select ask picker on certain color themes.
+- Fixed TUI row overlapping and duplication in the eval tool's live subagent progress tree under heavy concurrency.
+- Fixed session resumes after silent exits by recording pre-tool start markers and shutdown diagnostics.
+- Fixed status-line redraw crashes when tool-call arguments contain BigInt values.
+- Fixed terminal scrollback rows retaining old colors after theme switches.
+- Fixed Esc key behavior in the TUI to clear unrecoverable input instead of preserving drafts.
+- Fixed marketplace-installed plugins appearing redundantly in both the npm list and the extension status provider.
+- Fixed parent and peer IRC message delivery delays.
+- Fixed provider/model:auto entries in modelRoles collapsing to inherit and losing their auto state on reload.
+- Fixed plan execution prompts to avoid embedding the full plan, referencing the local plan file instead.
+- Fixed subagent live progress leaking raw tool output into the parent TUI.
+- Fixed eval subagents with custom output schemas receiving stale incremental yield labels.
+- Fixed hidden-thinking live status rows rendering as glyph-only lines by adding a persistent label.
+- Fixed /compact summary divider placement to keep it in the live scrollable region.
+- Fixed the time_spent status-line segment ticking continuously during idle sessions.
+- Fixed browser tool schema validation to require the code argument for run calls.
+- Improved robustness of MCP authentication error detection and header-based server discovery.
+- Fixed reliable detection of 401/403 authorization failures during Smithery commands and HTTP RPCs.
+- Improved streaming preview responsiveness for write, edit, and eval tools by decoding streamed string arguments incrementally.
+- Added retry-path diagnostics for assistant-tail removal and scheduled continuations after transient provider errors.
+- Fixed CJK history rendering issues across repeated compactions.
+- Fixed user-invoked skills failing to identify themselves or resolve relative paths across various execution paths.
+
 ## [16.2.13] - 2026-07-01
 
 ### Fixed

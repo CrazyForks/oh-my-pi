@@ -3523,7 +3523,7 @@ export const SETTINGS_SCHEMA = {
 
 	"inspect_image.timeoutMs": {
 		type: "number",
-		default: 180_000,
+		default: 300_000,
 		ui: {
 			tab: "tools",
 			group: "Execution",

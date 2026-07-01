@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { $which, hasFsCode, isEisdir, isEnoent, isEnotdir, Snowflake } from "@oh-my-pi/pi-utils";
+import type { Subprocess } from "bun";
 import {
 	parseDiffHunks as parseCommitDiffHunks,
 	parseFileDiffs,
@@ -150,7 +151,7 @@ export interface GitWorktreeEntry {
 // Error
 // ════════════════════════════════════════════════════════════════════════════
 
-export class GitCommandError extends Error {
+export class GitCommandError extends ToolError {
 	readonly args: readonly string[];
 	readonly result: GitCommandResult;
 
@@ -183,12 +184,28 @@ const AMBIENT_GIT_ENV = {
 	GIT_OBJECT_DIRECTORY: undefined,
 	GIT_ALTERNATE_OBJECT_DIRECTORIES: undefined,
 } satisfies Record<string, undefined>;
+const NON_INTERACTIVE_GIT_ENV = {
+	GIT_TERMINAL_PROMPT: "0",
+	GIT_ASKPASS: "true",
+	SSH_ASKPASS: "/usr/bin/false",
+	GPG_TTY: "not a tty",
+} satisfies Record<string, string>;
+const NON_INTERACTIVE_GH_ENV = {
+	...NON_INTERACTIVE_GIT_ENV,
+	GH_PROMPT_DISABLED: "1",
+} satisfies Record<string, string>;
+const SUBPROCESS_TIMEOUT_ENV = "OMP_GIT_SUBPROCESS_TIMEOUT_MS";
+const SUBPROCESS_MAX_OUTPUT_ENV = "OMP_GIT_SUBPROCESS_MAX_OUTPUT_BYTES";
+const DEFAULT_SUBPROCESS_TIMEOUT_MS = 120_000;
+const DEFAULT_SUBPROCESS_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 
 interface CommandOptions {
 	readonly env?: Record<string, string | undefined>;
+	readonly maxOutputBytes?: number;
 	readonly readOnly?: boolean;
 	readonly signal?: AbortSignal;
 	readonly stdin?: string | Uint8Array | ArrayBuffer | SharedArrayBuffer;
+	readonly timeoutMs?: number;
 }
 
 function normalizeStdin(input: CommandOptions["stdin"]): "ignore" | Uint8Array {
@@ -203,8 +220,119 @@ function buildGitEnv(overrides?: Record<string, string | undefined>): Record<str
 		...process.env,
 		GIT_OPTIONAL_LOCKS: "0",
 		...AMBIENT_GIT_ENV,
+		...NON_INTERACTIVE_GIT_ENV,
 		...overrides,
 	};
+}
+
+function buildGhEnv(): Record<string, string | undefined> {
+	return {
+		...process.env,
+		...NON_INTERACTIVE_GH_ENV,
+	};
+}
+
+function readByteLimitOverride(name: string, fallback: number): number {
+	const raw = process.env[name];
+	if (raw === undefined) return fallback;
+	const parsed = Number.parseInt(raw, 10);
+	if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+	return parsed;
+}
+
+function readTimeoutOverride(name: string, fallback: number): number {
+	const raw = process.env[name];
+	if (raw === undefined) return fallback;
+	const parsed = Number.parseInt(raw, 10);
+	if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+	return parsed;
+}
+
+function resolveSubprocessTimeoutMs(timeoutMs?: number): number {
+	return timeoutMs ?? readTimeoutOverride(SUBPROCESS_TIMEOUT_ENV, DEFAULT_SUBPROCESS_TIMEOUT_MS);
+}
+
+function resolveSubprocessMaxOutputBytes(maxOutputBytes?: number): number {
+	return maxOutputBytes ?? readByteLimitOverride(SUBPROCESS_MAX_OUTPUT_ENV, DEFAULT_SUBPROCESS_MAX_OUTPUT_BYTES);
+}
+
+function copyChunks(chunks: readonly Uint8Array[], totalBytes: number): Uint8Array {
+	const output = new Uint8Array(totalBytes);
+	let offset = 0;
+	for (const chunk of chunks) {
+		output.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return output;
+}
+
+async function readCappedStream(stream: ReadableStream<Uint8Array>, maxBytes: number): Promise<string> {
+	const reader = stream.getReader();
+	const chunks: Uint8Array[] = [];
+	let capturedBytes = 0;
+	let discardedBytes = 0;
+	try {
+		while (true) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			const remaining = Math.max(0, maxBytes - capturedBytes);
+			if (remaining > 0) {
+				const captured = value.byteLength > remaining ? value.slice(0, remaining) : value;
+				chunks.push(captured);
+				capturedBytes += captured.byteLength;
+			}
+			if (value.byteLength > remaining) {
+				discardedBytes += value.byteLength - remaining;
+			}
+		}
+	} finally {
+		reader.releaseLock();
+	}
+
+	const decoder = new TextDecoder();
+	const text = decoder.decode(copyChunks(chunks, capturedBytes));
+	if (discardedBytes === 0) return text;
+	const separator = text.length === 0 || text.endsWith("\n") ? "" : "\n";
+	return `${text}${separator}[truncated ${discardedBytes} bytes after ${maxBytes} byte limit]`;
+}
+
+async function waitForExit(
+	command: string,
+	args: readonly string[],
+	child: Subprocess,
+	timeoutMs: number,
+): Promise<number | null> {
+	const timeout = Promise.withResolvers<number | null>();
+	const timer = setTimeout(() => {
+		try {
+			child.kill();
+		} catch {
+			// Process may have exited between timer dispatch and kill.
+		}
+		timeout.reject(new ToolError(`${command} ${args.join(" ")} timed out after ${timeoutMs}ms`));
+	}, timeoutMs);
+	try {
+		return await Promise.race([child.exited, timeout.promise]);
+	} finally {
+		clearTimeout(timer);
+	}
+}
+
+async function captureSubprocessOutput(
+	command: string,
+	args: readonly string[],
+	child: Subprocess,
+	options: Pick<CommandOptions, "maxOutputBytes" | "timeoutMs"> = {},
+): Promise<GitCommandResult> {
+	const maxOutputBytes = resolveSubprocessMaxOutputBytes(options.maxOutputBytes);
+	const timeoutMs = resolveSubprocessTimeoutMs(options.timeoutMs);
+	const [stdout, stderr, exitCode] = await Promise.all([
+		readCappedStream(child.stdout as ReadableStream<Uint8Array>, maxOutputBytes),
+		readCappedStream(child.stderr as ReadableStream<Uint8Array>, maxOutputBytes),
+		waitForExit(command, args, child, timeoutMs),
+	]);
+
+	return { exitCode: exitCode ?? 0, stdout, stderr };
 }
 
 function ensureAvailable(): void {
@@ -240,13 +368,14 @@ async function git(cwd: string, args: readonly string[], options: CommandOptions
 		throw new Error("Failed to capture git command output.");
 	}
 
-	const [stdout, stderr, exitCode] = await Promise.all([
-		new Response(child.stdout).text(),
-		new Response(child.stderr).text(),
-		child.exited,
-	]);
-
-	return { exitCode: exitCode ?? 0, stdout, stderr };
+	try {
+		const result = await captureSubprocessOutput("git", commandArgs, child, options);
+		throwIfAborted(options.signal);
+		return result;
+	} catch (error) {
+		if (options.signal?.aborted) throw new ToolAbortError();
+		throw error;
+	}
 }
 
 function withNoOptionalLocks(args: readonly string[]): string[] {
@@ -1821,7 +1950,9 @@ export interface GhCommandResult {
 }
 
 export interface GhCommandOptions {
+	maxOutputBytes?: number;
 	repoProvided?: boolean;
+	timeoutMs?: number;
 	trimOutput?: boolean;
 }
 
@@ -1857,6 +1988,7 @@ export const github = {
 		try {
 			const child = Bun.spawn(["gh", ...args], {
 				cwd,
+				env: buildGhEnv(),
 				stdin: "ignore",
 				stdout: "pipe",
 				stderr: "pipe",
@@ -1866,17 +1998,13 @@ export const github = {
 			if (!child.stdout || !child.stderr) {
 				throw new ToolError("Failed to capture GitHub CLI output.");
 			}
-			const [stdout, stderr, exitCode] = await Promise.all([
-				new Response(child.stdout).text(),
-				new Response(child.stderr).text(),
-				child.exited,
-			]);
+			const result = await captureSubprocessOutput("gh", args, child, options);
 			throwIfAborted(signal);
 			const trim = options?.trimOutput !== false;
 			return {
-				exitCode: exitCode ?? 0,
-				stdout: trim ? stdout.trim() : stdout,
-				stderr: trim ? stderr.trim() : stderr,
+				exitCode: result.exitCode,
+				stdout: trim ? result.stdout.trim() : result.stdout,
+				stderr: trim ? result.stderr.trim() : result.stderr,
 			};
 		} catch (error) {
 			if (signal?.aborted) throw new ToolAbortError();

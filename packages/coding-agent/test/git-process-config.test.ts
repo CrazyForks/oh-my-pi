@@ -21,13 +21,14 @@ function createTextStream(text: string): ReadableStream<Uint8Array> {
 	return body;
 }
 
-function createFakeProcess(stdout = "", stderr = "", exitCode = 0): Subprocess {
+function createFakeProcess(stdout = "", stderr = "", exitCode: number | Promise<number> = 0): Subprocess {
 	return {
 		pid: 12345,
 		stdout: createTextStream(stdout),
 		stderr: createTextStream(stderr),
-		exited: Promise.resolve(exitCode),
-	} as Subprocess;
+		exited: typeof exitCode === "number" ? Promise.resolve(exitCode) : exitCode,
+		kill: vi.fn(),
+	} as unknown as Subprocess;
 }
 
 function createSpawnMock(calls: SpawnCall[]) {
@@ -44,6 +45,26 @@ function createSpawnMock(calls: SpawnCall[]) {
 	}
 
 	return mockSpawn;
+}
+
+async function withEnvOverrides<T>(
+	overrides: readonly (readonly [key: string, value: string | undefined])[],
+	run: () => Promise<T>,
+): Promise<T> {
+	const previous = new Map<string, string | undefined>();
+	for (const [key, value] of overrides) {
+		previous.set(key, process.env[key]);
+		if (value === undefined) delete process.env[key];
+		else process.env[key] = value;
+	}
+	try {
+		return await run();
+	} finally {
+		for (const [key, value] of previous) {
+			if (value === undefined) delete process.env[key];
+			else process.env[key] = value;
+		}
+	}
 }
 
 afterEach(() => {
@@ -109,5 +130,64 @@ describe("git subprocess config", () => {
 			"fork",
 			"HEAD:refs/heads/feature",
 		]);
+	});
+
+	it("forces git subprocesses into non-interactive credential mode", async () => {
+		const spawnCalls: SpawnCall[] = [];
+		vi.spyOn(Bun, "spawn").mockImplementation(createSpawnMock(spawnCalls));
+
+		await withEnvOverrides(
+			[
+				["GIT_TERMINAL_PROMPT", undefined],
+				["GIT_ASKPASS", undefined],
+				["SSH_ASKPASS", undefined],
+				["GPG_TTY", undefined],
+			],
+			() => git.push("/work/pi", { remote: "fork", refspec: "HEAD:refs/heads/feature" }),
+		);
+
+		expect(spawnCalls[0]?.options.env).toMatchObject({
+			GIT_TERMINAL_PROMPT: "0",
+			GIT_ASKPASS: "true",
+			SSH_ASKPASS: "/usr/bin/false",
+			GPG_TTY: "not a tty",
+		});
+	});
+
+	it("rejects when a git subprocess never exits", async () => {
+		const spawnCalls: SpawnCall[] = [];
+		const neverExits = Promise.withResolvers<number>();
+		vi.spyOn(Bun, "spawn").mockImplementation(() => {
+			const process = createFakeProcess("", "", neverExits.promise);
+			spawnCalls.push({ cmd: ["git", "push"], options: {} as SpawnOptions });
+			return process;
+		});
+
+		const result = await withEnvOverrides([["OMP_GIT_SUBPROCESS_TIMEOUT_MS", "1"]], () =>
+			Promise.race([
+				git.push("/work/pi", { remote: "fork", refspec: "HEAD:refs/heads/feature" }).then(
+					() => "resolved",
+					error => error,
+				),
+				Bun.sleep(50).then(() => "still-running"),
+			]),
+		);
+
+		expect(result).toBeInstanceOf(Error);
+		expect(result).not.toBe("still-running");
+		expect(result).not.toBe("resolved");
+		expect(spawnCalls).toHaveLength(1);
+	});
+
+	it("caps captured git subprocess output", async () => {
+		vi.spyOn(Bun, "spawn").mockImplementation(() => createFakeProcess("abcdefghijklmnop"));
+
+		const stdout = await withEnvOverrides([["OMP_GIT_SUBPROCESS_MAX_OUTPUT_BYTES", "8"]], () =>
+			git.diff.tree("/work/pi", "base", "head", { allowFailure: true }),
+		);
+
+		expect(stdout).toContain("abcdefgh");
+		expect(stdout).toContain("truncated 8 bytes after 8 byte limit");
+		expect(stdout).not.toContain("ijklmnop");
 	});
 });

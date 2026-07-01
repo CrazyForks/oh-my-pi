@@ -374,6 +374,93 @@ describe("StdinBuffer", () => {
 		});
 	});
 
+	describe("Malformed Escape Sequences", () => {
+		// Cap declared in `stdin-buffer.ts` — kept in sync with `MAX_ESCAPE_LENGTH`.
+		const MAX_ESCAPE_LENGTH = 64 * 1024;
+
+		it("processes a runaway CSI in linear time and flushes at the cap", () => {
+			// A malformed CSI with no final byte (megabytes of parameter bytes)
+			// used to be quadratic — a 4 MB partial blocked the event loop for
+			// hundreds of ms of synchronous slice+scan. The rewrite caps the
+			// scan window and flushes the prefix so no single `process()` call
+			// hangs the loop even under a hostile stream (issue #4022).
+			const input = `\x1b[${";".repeat(MAX_ESCAPE_LENGTH * 2)}`;
+			const start = performance.now();
+			processInput(input);
+			const elapsed = performance.now() - start;
+			expect(elapsed).toBeLessThan(500);
+			// First emission is the capped ESC-prefixed chunk; the tail resyncs
+			// as ordinary plain-char events.
+			expect(emittedSequences[0]!.length).toBe(MAX_ESCAPE_LENGTH);
+			expect(emittedSequences[0]!.charCodeAt(0)).toBe(0x1b);
+			expect(emittedSequences.length).toBe(1 + input.length - MAX_ESCAPE_LENGTH);
+			expect(emittedSequences[emittedSequences.length - 1]).toBe(";");
+		});
+
+		it("processes a runaway SGR mouse partial in linear time and flushes at the cap", () => {
+			// SGR-shaped CSI (`\x1b[<...`) is the worst prior offender because
+			// each grow-a-substring iteration re-tested a regex on the full
+			// candidate. The cap now bounds the scan to `MAX_ESCAPE_LENGTH`
+			// regardless of stream size.
+			const input = `\x1b[<${"1;".repeat(MAX_ESCAPE_LENGTH)}`;
+			const start = performance.now();
+			processInput(input);
+			const elapsed = performance.now() - start;
+			expect(elapsed).toBeLessThan(500);
+			expect(emittedSequences[0]!.length).toBe(MAX_ESCAPE_LENGTH);
+			expect(emittedSequences[0]!.charCodeAt(0)).toBe(0x1b);
+		});
+
+		it("processes a runaway OSC without ST/BEL in linear time and flushes at the cap", () => {
+			// OSC endsWith(ST|BEL) was O(n) per iteration on the growing
+			// candidate; the linear scan looks for the terminator once.
+			const input = `\x1b]0;${"x".repeat(MAX_ESCAPE_LENGTH * 2)}`;
+			const start = performance.now();
+			processInput(input);
+			const elapsed = performance.now() - start;
+			expect(elapsed).toBeLessThan(500);
+			expect(emittedSequences[0]!.length).toBe(MAX_ESCAPE_LENGTH);
+			expect(emittedSequences[0]!.startsWith("\x1b]0;")).toBe(true);
+		});
+
+		it("processes a runaway DCS without ST in linear time and flushes at the cap", () => {
+			const input = `\x1bP>|${"x".repeat(MAX_ESCAPE_LENGTH)}`;
+			const start = performance.now();
+			processInput(input);
+			const elapsed = performance.now() - start;
+			expect(elapsed).toBeLessThan(500);
+			expect(emittedSequences[0]!.length).toBe(MAX_ESCAPE_LENGTH);
+			expect(emittedSequences[0]!.startsWith("\x1bP>|")).toBe(true);
+		});
+
+		it("processes a runaway APC without ST in linear time and flushes at the cap", () => {
+			const input = `\x1b_G${"x".repeat(MAX_ESCAPE_LENGTH)}`;
+			const start = performance.now();
+			processInput(input);
+			const elapsed = performance.now() - start;
+			expect(elapsed).toBeLessThan(500);
+			expect(emittedSequences[0]!.length).toBe(MAX_ESCAPE_LENGTH);
+			expect(emittedSequences[0]!.startsWith("\x1b_G")).toBe(true);
+		});
+
+		it("keeps a legitimate long CSI under the cap intact", () => {
+			// 100 numeric parameters is well within the cap and MUST still
+			// parse as one sequence — the cap only trips runaway partials.
+			const params = Array.from({ length: 100 }, () => "1").join(";");
+			const seq = `\x1b[${params}H`;
+			processInput(seq);
+			expect(emittedSequences).toEqual([seq]);
+		});
+
+		it("keeps a legitimate long OSC under the cap intact", () => {
+			// A 32 KiB OSC payload terminated with ST is well below the cap.
+			const payload = "a".repeat(32 * 1024);
+			const seq = `\x1b]52;c;${payload}\x1b\\`;
+			processInput(seq);
+			expect(emittedSequences).toEqual([seq]);
+		});
+	});
+
 	describe("Flush", () => {
 		it("should flush incomplete sequences", () => {
 			processInput("\x1b[<35");

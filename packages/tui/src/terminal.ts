@@ -426,6 +426,37 @@ function isPrivateModeSupported(status: string): boolean {
 }
 
 /**
+ * Regex patterns the `#setupStdinBuffer` data handler probes each stdin
+ * sequence against — kitty keyboard protocol reply, Mode 2031 DSR, OSC 11
+ * appearance response, DA1 sentinel, private CSI reassembly prefix, DECRPM
+ * private-mode report, and DEC 2048 in-band resize report.
+ *
+ * Exported so tests can pin the invariant the fast-path guard relies on:
+ * every pattern anchors on `\x1b`, so a non-ESC sequence with no reassembly
+ * buffer in flight can be forwarded to the input handler unconditionally
+ * (issue #4022 — a non-bracketed paste emits one `data` event per Unicode
+ * scalar, and running six regex probes per scalar dominates the paste path).
+ */
+export const STDIN_ESCAPE_PROBE_PATTERNS = {
+	// Kitty protocol response pattern: \x1b[?<flags>u
+	kittyResponse: /^\x1b\[\?(\d+)u$/,
+	// Mode 2031 DSR response: \x1b[?997;{1=dark,2=light}n
+	appearanceDsr: /^\x1b\[\?997;([12])n$/,
+	// OSC 11 response: \x1b]11;rgb:RR/GG/BB or rgba:RR/GG/BB, terminated by BEL or ST.
+	osc11Response: /^\x1b\]11;rgba?:([0-9a-fA-F]{1,4})\/([0-9a-fA-F]{1,4})\/([0-9a-fA-F]{1,4})(?:\x07|\x1b\\)$/,
+	// DA1 (Primary Device Attributes) response: \x1b[?...c
+	da1Response: /^\x1b\[\?[\d;]*c$/,
+	// Private CSI partial: \x1b[?<digits/semicolons>... — incomplete probe response
+	// that the StdinBuffer flushed before the terminator arrived (split across
+	// stdin reads). Used to reassemble DA1, kitty, and Mode 2031 replies.
+	privateCsiPartial: /^\x1b\[\?[\d;]*[\x20-\x2f]*$/,
+	// DECRPM private-mode report (DECRQM reply): \x1b[?<mode>;<status>$y
+	decrpmResponse: /^\x1b\[\?(\d+);(\d+)\$y$/,
+	// In-band resize report (DEC mode 2048): \x1b[48;rows;cols;yPixels;xPixels t
+	inBandResize: /^\x1b\[48;(\d+);(\d+);(\d+);(\d+)t$/,
+} as const;
+
+/**
  * Real terminal using process.stdin/stdout
  */
 export class ProcessTerminal implements Terminal {
@@ -667,32 +698,40 @@ export class ProcessTerminal implements Terminal {
 		// proved too tight for split escapes (#1238 covered only probe replies).
 		this.#stdinBuffer = new StdinBuffer({ timeout: 50 });
 
-		// Kitty protocol response pattern: \x1b[?<flags>u
-		const kittyResponsePattern = /^\x1b\[\?(\d+)u$/;
-
-		// Mode 2031 DSR response: \x1b[?997;{1=dark,2=light}n
-		const appearanceDsrPattern = /^\x1b\[\?997;([12])n$/;
-
-		// OSC 11 response: \x1b]11;rgb:RR/GG/BB or rgba:RR/GG/BB, terminated by BEL or ST.
-		const osc11ResponsePattern =
-			/^\x1b\]11;rgba?:([0-9a-fA-F]{1,4})\/([0-9a-fA-F]{1,4})\/([0-9a-fA-F]{1,4})(?:\x07|\x1b\\)$/;
-
-		// DA1 (Primary Device Attributes) response: \x1b[?...c
-		const da1ResponsePattern = /^\x1b\[\?[\d;]*c$/;
-
-		// Private CSI partial: \x1b[?<digits/semicolons>... — incomplete probe response
-		// that the StdinBuffer flushed before the terminator arrived (split across
-		// stdin reads). Used to reassemble DA1, kitty, and Mode 2031 replies.
-		const privateCsiPartialPattern = /^\x1b\[\?[\d;]*[\x20-\x2f]*$/;
-
-		// DECRPM private-mode report (DECRQM reply): \x1b[?<mode>;<status>$y
-		const decrpmResponsePattern = /^\x1b\[\?(\d+);(\d+)\$y$/;
-
-		// In-band resize report (DEC mode 2048): \x1b[48;rows;cols;yPixels;xPixels t
-		const inBandResizePattern = /^\x1b\[48;(\d+);(\d+);(\d+);(\d+)t$/;
+		// See {@link STDIN_ESCAPE_PROBE_PATTERNS} at module scope. Local aliases
+		// keep the inline logic below readable.
+		const kittyResponsePattern = STDIN_ESCAPE_PROBE_PATTERNS.kittyResponse;
+		const appearanceDsrPattern = STDIN_ESCAPE_PROBE_PATTERNS.appearanceDsr;
+		const osc11ResponsePattern = STDIN_ESCAPE_PROBE_PATTERNS.osc11Response;
+		const da1ResponsePattern = STDIN_ESCAPE_PROBE_PATTERNS.da1Response;
+		const privateCsiPartialPattern = STDIN_ESCAPE_PROBE_PATTERNS.privateCsiPartial;
+		const decrpmResponsePattern = STDIN_ESCAPE_PROBE_PATTERNS.decrpmResponse;
+		const inBandResizePattern = STDIN_ESCAPE_PROBE_PATTERNS.inBandResize;
 
 		// Forward individual sequences to the input handler
 		this.#stdinBuffer.on("data", (sequence: string) => {
+			// Fast path — plain non-ESC bytes with no reassembly in flight
+			// bypass the entire escape-probe suite (six unconditional regex
+			// checks and four buffered-reassembly branches, all of which
+			// require an ESC-prefixed sequence). Every probe pattern below
+			// starts with `\x1b`, so a non-ESC scalar can only be relevant
+			// when a reassembly buffer is already accumulating a split
+			// response and the next bytes are its tail. Without this guard, a
+			// non-bracketed paste that arrives as one `data` event per Unicode
+			// scalar runs the whole probe suite per event — issue #4022.
+			// (Single-event delivery is preserved so `matchesKey`/
+			// `isKeyRelease` still see the per-scalar boundary — see
+			// `#setupStdinBuffer` comment at line 654.)
+			if (
+				sequence.charCodeAt(0) !== 0x1b &&
+				!this.#privateCsiResponseBuffer &&
+				!this.#inBandResizeBuffer &&
+				!this.#osc11ResponseBuffer &&
+				!this.#osc99ResponseBuffer
+			) {
+				this.#inputHandler?.(sequence);
+				return;
+			}
 			// Reassemble split private CSI responses (DA1, kitty keyboard, Mode 2031).
 			// When the terminal writes the response slowly enough that the StdinBuffer's
 			// flush timeout elapses mid-sequence, the prefix `\x1b[?<digits>` arrives as

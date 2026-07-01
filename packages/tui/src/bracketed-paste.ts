@@ -41,15 +41,45 @@ export function decodeReencodedPasteControls(text: string): string {
 }
 
 /**
+ * Options for {@link BracketedPasteHandler}.
+ */
+export type BracketedPasteHandlerOptions = {
+	/**
+	 * Maximum bytes to accumulate before assuming the end marker was lost and
+	 * force-delivering the buffered payload as a completed paste. Defaults to
+	 * 64 MiB — matches `StdinBuffer`'s paste cap and is well above any
+	 * realistic clipboard payload while still bounding memory if an alternate
+	 * caller (i.e. one that bypasses `StdinBuffer`, which already re-wraps
+	 * paste bodies with both markers) hands a start marker without an end.
+	 */
+	byteLimit?: number;
+};
+
+// Default byte cap, aligned with `StdinBuffer.PASTE_MAX_BYTES`. Defense in
+// depth for alternate callers of `handleInput` / `BracketedPasteHandler.process`
+// that don't go through the normal `StdinBuffer` → re-wrap path (issue #4022).
+const DEFAULT_PASTE_BYTE_LIMIT = 64 * 1024 * 1024;
+
+/**
  * Handles bracketed paste mode buffering for terminal input components.
  *
  * Bracketed paste mode wraps pasted content between start (\x1b[200~) and
  * end (\x1b[201~) markers, which may arrive split across multiple chunks.
  * This class buffers incoming data and assembles complete paste payloads.
+ *
+ * If more than `byteLimit` bytes arrive without an end marker (dropped in
+ * transit, or the caller synthesized a start with no matching end), the
+ * accumulated bytes are delivered as a completed paste so input recovers
+ * instead of the buffer growing without bound.
  */
 export class BracketedPasteHandler {
 	#buffer = "";
 	#active = false;
+	readonly #byteLimit: number;
+
+	constructor(options: BracketedPasteHandlerOptions = {}) {
+		this.#byteLimit = options.byteLimit ?? DEFAULT_PASTE_BYTE_LIMIT;
+	}
 
 	/**
 	 * Process incoming terminal data for bracketed paste sequences.
@@ -57,7 +87,8 @@ export class BracketedPasteHandler {
 	 * @returns `{ handled: false }` if the data contains no paste sequence and
 	 *          should be processed normally. `{ handled: true }` if the data was
 	 *          consumed by paste buffering — `pasteContent` is set when a complete
-	 *          paste has been assembled; omitted when still buffering.
+	 *          paste has been assembled (either the end marker arrived or the
+	 *          byte cap was exceeded); omitted when still buffering.
 	 */
 	process(data: string): PasteResult {
 		if (data.includes(PASTE_START)) {
@@ -71,7 +102,18 @@ export class BracketedPasteHandler {
 		this.#buffer += data;
 
 		const endIndex = this.#buffer.indexOf(PASTE_END);
-		if (endIndex === -1) return { handled: true, remaining: "" };
+		if (endIndex === -1) {
+			if (this.#buffer.length > this.#byteLimit) {
+				// End marker never arrived and the buffer has grown past the
+				// cap. Deliver what we've collected as a completed paste and
+				// reset so subsequent input is not accumulated forever.
+				const pasteContent = this.#buffer;
+				this.#buffer = "";
+				this.#active = false;
+				return { handled: true, pasteContent, remaining: "" };
+			}
+			return { handled: true, remaining: "" };
+		}
 
 		const pasteContent = this.#buffer.substring(0, endIndex);
 		const remaining = this.#buffer.substring(endIndex + PASTE_END.length);

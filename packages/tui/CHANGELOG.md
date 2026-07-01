@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed terminal input parsing blocking the event loop on hostile or malformed escape sequences and non-bracketed pastes. `StdinBuffer.extractCompleteSequences` now scans escape sequences with index-based `charCodeAt` walks (no grow-a-substring quadratic) and caps each sequence at 64 KiB before flushing the prefix as raw bytes, so an unterminated CSI/OSC/DCS/APC can no longer stall input in a single `process()` call. `BracketedPasteHandler` gained a configurable byte cap (default 64 MiB, matching `StdinBuffer.PASTE_MAX_BYTES`) that delivers the buffered payload as a completed paste when the end marker never arrives, matching `StdinBuffer`'s paste recovery as defense in depth for alternate callers. The `ProcessTerminal` stdin data handler now fast-paths plain non-ESC bytes past its six escape-probe regex checks when no reassembly buffer is in flight, cutting per-event CPU on large non-bracketed pastes ([#4022](https://github.com/can1357/oh-my-pi/issues/4022)).
+
 ## [16.2.12] - 2026-07-01
 
 ### Fixed

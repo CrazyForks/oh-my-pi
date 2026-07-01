@@ -683,6 +683,22 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(restarted.obfuscate(second)).toBe(second);
 	});
 
+	it("obfuscates a short cut suffix covered by a full-length placeholder-context match", () => {
+		const obf = new SecretObfuscator(
+			[
+				{ type: "plain", content: "ABCDEFGH" },
+				{ type: "regex", content: "(?<=ABCD)[A-Z]{8}" },
+			],
+			"Q".repeat(43),
+		);
+
+		const second = obf.obfuscate("ABCDEFGHIJKL");
+
+		expect(second).not.toContain("IJKL");
+		expect(obf.deobfuscate(second)).toBe("ABCDEFGHIJKL");
+		expect(obf.obfuscate(second)).toBe(second);
+	});
+
 	it("keeps default replace markers stable when a lookbehind match spills into a prior placeholder", () => {
 		const key = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA1n";
 		const entries = [

@@ -1233,7 +1233,7 @@ export class SecretObfuscator {
 						start = suffixStart;
 						end = suffixEnd;
 						scanMatchValue = scanText.slice(suffixStart, suffixEnd);
-						scanMatchLength = scanMatchValue.length;
+						scanMatchLength = match[0].length;
 						mapped = suffixMapped;
 						regex.lastIndex = suffixEnd;
 						handledOutside = true;

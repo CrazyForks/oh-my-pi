@@ -1454,6 +1454,63 @@ describe("advisor", () => {
 			expect(strippedNotices).toBe(1); // fired exactly once, not per turn
 		});
 
+		it("counts turns queued during a refusal before requeueing the stripped re-prime", async () => {
+			const promptInputs: string[] = [];
+			const { promise: firstPromptStarted, resolve: startFirstPrompt } = Promise.withResolvers<void>();
+			const { promise: firstPrompt, reject: rejectFirstPrompt } = Promise.withResolvers<void>();
+			let promptCalls = 0;
+			const agent: AdvisorAgent = {
+				prompt: input => {
+					promptInputs.push(input);
+					promptCalls++;
+					if (promptCalls === 1) {
+						startFirstPrompt();
+						return firstPrompt;
+					}
+					return Promise.resolve();
+				},
+				abort: () => {},
+				reset: () => {},
+				state: { messages: [] },
+			};
+			const messages: AgentMessage[] = [
+				{ role: "user", content: "first turn", timestamp: 1 } as AgentMessage,
+				{
+					role: "assistant",
+					content: [
+						{ type: "thinking", thinking: "thinking that triggers refusal" },
+						{ type: "text", text: "first reply" },
+					],
+					timestamp: 2,
+				} as unknown as AgentMessage,
+			];
+			const host: AdvisorRuntimeHost = {
+				snapshotMessages: () => messages,
+				enqueueAdvice: () => {},
+			};
+			const runtime = new AdvisorRuntime(agent, host, 0);
+
+			runtime.onTurnEnd(messages);
+			await firstPromptStarted;
+			expect(runtime.backlog).toBe(1);
+
+			messages.push({ role: "user", content: "second queued turn", timestamp: 3 } as AgentMessage);
+			runtime.onTurnEnd(messages);
+			expect(runtime.backlog).toBe(2);
+
+			rejectFirstPrompt(new Error("Refusal (reasoning_extraction): refused while backlog queued."));
+			await Bun.sleep(0);
+			await Bun.sleep(0);
+			await Bun.sleep(0);
+
+			expect(promptInputs).toHaveLength(2);
+			expect(promptInputs[0]).toContain("_thinking:_");
+			expect(promptInputs[1]).not.toContain("_thinking:_");
+			expect(promptInputs[1]).toContain("first turn");
+			expect(promptInputs[1]).toContain("second queued turn");
+			expect(runtime.backlog).toBe(0);
+		});
+
 		it("respects an explicit includeThinking:false at construction time", async () => {
 			// The `advisor.includeThinking` escape hatch: user opts out proactively,
 			// so no thinking ever renders and no auto-degrade path runs.

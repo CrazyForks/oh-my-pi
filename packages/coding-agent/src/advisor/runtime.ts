@@ -371,17 +371,20 @@ export class AdvisorRuntime {
 					// refusal" per Anthropic's refusals-and-fallback docs. Latch thinking
 					// off for the rest of the session, drop dedupe state so the re-primed
 					// transcript replays primary-context in full, and re-render the
-					// current transcript without thinking so the failed batch's coverage
-					// is restored on the next drain iteration.
+					// current transcript without thinking so the failed batch plus any
+					// turns queued while it was in flight are restored on the next drain
+					// iteration.
 					if (isRefusalError(err) && this.#includeThinking && !this.#refusalStripApplied) {
+						const queuedTurns = this.#pending.reduce((sum, b) => sum + b.turns, 0);
+						const restoredTurns = finalTurns + queuedTurns;
 						this.#includeThinking = false;
 						this.#refusalStripApplied = true;
 						this.#resetAdvisorContext(false, false);
 						const restripped = this.#renderDelta(this.#latestMessages);
 						if (restripped) {
-							this.#pending.unshift({ text: restripped, turns: finalTurns });
+							this.#pending.unshift({ text: restripped, turns: restoredTurns });
 						} else {
-							this.#backlog = Math.max(0, this.#backlog - finalTurns);
+							this.#backlog = Math.max(0, this.#backlog - restoredTurns);
 							this.#notifyWaiters();
 						}
 						try {

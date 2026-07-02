@@ -20,8 +20,14 @@
 - Fixed a secret regex whose match straddles a previously generated `#…#` placeholder still rewriting short surrounding raw bytes the regex never needed, drifting the `obfuscate()` fixed point and provider-visible history/prompt-cache prefixes across re-obfuscation passes. When a greedy match (e.g. `[A-Z0-9]{8,12}`) reaches across a prior-call placeholder whose own value already satisfies the pattern, a trailing/leading raw chunk that does not independently match is now left verbatim instead of being rewritten on the next pass — in obfuscate mode the chunk was minted into a fresh placeholder (`…SECRETUV→#…#A`), and in default replace mode its deterministic scramble drifted (`…#…#ZZJ5sotJ` → `…#…#ZZpvsotJ`). Surrounding bytes are still redacted when the placeholder value alone cannot satisfy the regex (e.g. a required `api_key=` prefix) or when they independently match it ([#2465](https://github.com/can1357/oh-my-pi/issues/2465)).
 - Fixed a secret regex match straddling a prior-call placeholder with independently-matching raw bytes on one or both sides leaking those bytes unredacted, in two ways. First, the spillover check concatenated the outside-placeholder chunks before testing whether they independently satisfy the regex, which erased the placeholder-token boundary between them — e.g. with `\b[A-Z]{8}\b|[A-Z]{17}` and a placeholder for `SECRETUV` flanked by prefix `ABCDEFGH` (matches on its own) and suffix `I` (does not), the concatenated `ABCDEFGHI` matched neither alternative, so `ABCDEFGH` was treated as spillover and left verbatim. Second, testing each chunk in isolation (an out-of-context substring) broke context-sensitive patterns — lookbehind, lookahead, and `\b` — that depend on bytes actually adjacent to the chunk in the source text but outside its own range: `(?<=api=)[0-9]{8}` over `api=12345678` plus a trailing placeholder failed when `12345678` was tested standalone, since the isolated slice has no `api=` immediately before it. Each outside chunk is now tested at its real position in the source text, so lookbehind/lookahead see the actual surrounding bytes while a match spanning into the placeholder itself still doesn't count as independent.
 
+### Added
+
+- Added `providers.anthropic.serverSideFallback` (default off; UI in the "Model → Retry & Fallback" group). When enabled, Claude Fable 5 / Mythos 5 requests carry `fallbacks: [{ model: "claude-opus-4-8" }]` via Anthropic's server-side-fallback beta chain so classifier-blocked turns are retried on Opus 4.8 without breaking the current call. Opt-in only — leaving it off preserves the pre-fallback behavior. ([#4177](https://github.com/can1357/oh-my-pi/issues/4177))
+- Added `task.softRequestBudgetNotice` (default off) to opt into the subagent soft-budget wrap-up steering notice while keeping the 1.5x graceful abort guard active.
+
 ### Changed
 
+- Updated the tester subagent prompt to explicitly forbid testing default configuration values and allow skipping tests entirely for trivial changes
 - Optimized session loading and rendering performance, including a 10x speedup for smooth streaming reveals on large messages, 35% faster session resumes for large files using native streaming JSONL parsing, and reduced overhead for edit-patch fallbacks.
 - Improved TUI responsiveness and reduced CPU usage during long-running tool sessions by throttling status-line redraws and optimizing subagent persistence checks.
 - Updated the advisor system prompt and documentation to accurately reflect WATCHDOG.yml tool grants.
@@ -29,9 +35,22 @@
 
 ### Fixed
 
+- Fixed sequential patch/edit failures leaving dirty buffers in multi-file edits by flushing the LSP writethrough queue upfront on early abort paths
+- Fixed the subagent task preview erroneously showing "ctrl+o: Expand" hints on output lines capped inside the already-expanded view
+
+- Fixed the cross-file write batching regression in `apply_patch` multi-file operations by reverting to flushing only on the last file write or explicitly on early failure paths, and refactored error counting to use clean booleans.
+- Fixed collab teardown (`/collab stop`, unrecoverable relay drop) cancelling a hook selector/editor the host user was actively typing in: teardown resolved pending guest asks the same way as a guest cancel, so the mirrored race dismissed the local dialog and dropped its input. Teardown now settles guest asks as `unavailable`, and the local dialog keeps running and wins with its eventual answer.
+- Fixed RPC mode deferred shutdown (`pi.shutdown()`) killing the process while a background-dispatched `bash` command was still running: the response frame is now written before exit, and a shutdown requested mid-bash fires once the command settles even when no further client frames arrive.
+- Fixed collab-guest transcript viewer rendering host-delivered errors raw: multi-line stacks broke the frame's row accounting and absolute host paths leaked to guests; errors are now collapsed to one sanitized, truncated row.
+- Fixed streaming tool-arg previews capturing string fields (e.g. `content`) from nested objects and injecting them as top-level args mid-stream; only top-level keys are read incrementally now.
+- Fixed task.maxConcurrency being breachable when a queued spawn was cancelled: the spawn path could release a semaphore permit it never acquired, letting a later task start while the cap was saturated.
+- Fixed session exit diagnostics recording signal and crash exits (SIGTERM, SIGHUP, uncaught exceptions) as a normal "dispose": the postmortem teardown now threads the real reason into session disposal.
+- Fixed the subagent yield-label guard ignoring JTD discriminator (oneOf) output schemas, which let stale incremental labels pass into successful results when final validation was skipped after retries.
+- Fixed grep/ast_grep search scopes rejecting `www.` and collapsed-scheme (`https:/host`) URL spellings that the read tool accepts; unresolvable URL-shaped scopes now fail with an explicit external-URL error instead of "Path not found".
+- Fixed model discovery ignoring `NODE_EXTRA_CA_CERTS`: the model registry's default fetch now applies the extra-CA wrapper, so `/models` probes work behind private-CA gateways like provider chat requests.
 - Fixed ctrl+p role-model cycling getting stuck on one transition and skipping every other role: a session-branch traversal regression returned entries leaf-to-root, so the cycle (and session model restore) read the oldest recorded model change instead of the newest.
 - Fixed ctrl+p cycling from a stale slot after the model was switched through another surface (alt+m, /model, retry fallback): the recorded role is now trusted only while its resolved model is still the active model, falling back to matching by model.
-- Fixed the apply_patch tool to prevent silently overwriting pre-existing files during creation or renaming, rejecting upfront with an error instead.
+- Fixed the `apply_patch` envelope to reject `*** Add File` / `*** Move to` targeting a pre-existing file upfront instead of silently overwriting it. The JSON `patch` mode's `op: "create"` intentionally remains the documented full-file overwrite (rename stays non-overwriting in both modes).
 - Fixed multi-file apply_patch to stop at the first failing file, surface applied vs. skipped paths, and correctly report the error to the agent loop.
 - Fixed process termination (SIGTERM, SIGHUP, uncaught exceptions) skipping editor draft saves, session shutdown events, and background job cleanup.
 - Fixed /quit and /exit commands blocking session closure by introducing a shutdown budget and backgrounding remaining tasks.
@@ -39,6 +58,7 @@
 - Fixed RPC mode abort_bash being blocked by running bash commands by dispatching bash in the background.
 - Fixed task.maxConcurrency and task.maxRecursionDepth limits being bypassed by sub-spawn paths, ensuring limits are dynamically resized and respected.
 - Fixed the edit tool inflating session files by pruning extremely large file snapshots from tool-result details.
+- Fixed edit-tool Markdown list guidance so hashline parser errors and the model-facing prompt teach `+- item` escaping instead of steering agents toward full-file `write` fallbacks. ([#4179](https://github.com/can1357/oh-my-pi/issues/4179))
 - Fixed workstation OS detection rendering "Kernel: unknown" on macOS 15+.
 - Fixed /copy code and /copy cmd commands being treated as normal prompts instead of copying the requested blocks.
 - Fixed interactive bash status line not updating after directory changes (cd).
@@ -50,6 +70,8 @@
 - Fixed search and AST tools accepting external read URLs by materializing fetched URL text through the read cache before path resolution.
 - Fixed Tavily web search to retry without recency filters if no content is returned.
 - Fixed extension validation failures for omp install pi-lean-ctx by exposing legacy tool factories.
+- Fixed legacy `createReadTool`/`createReadToolDefinition` ignoring `autoResizeImages`; the option now maps onto the `images.autoResize` setting of the underlying read tool.
+- Fixed legacy `createGrepTool`/`createGrepToolDefinition` silently ignoring options: an explicit `context` parameter is now forwarded to the built-in grep (as symmetric before/after context), the unsupported `limit` parameter is no longer advertised in the tool schema, and supplying legacy `operations` throws a descriptive error at creation time instead of silently searching the local filesystem.
 - Fixed visibility of the focused option in the multi-select ask picker on certain color themes.
 - Fixed TUI row overlapping and duplication in the eval tool's live subagent progress tree under heavy concurrency.
 - Fixed session resumes after silent exits by recording pre-tool start markers and shutdown diagnostics.
@@ -72,6 +94,14 @@
 - Added retry-path diagnostics for assistant-tail removal and scheduled continuations after transient provider errors.
 - Fixed CJK history rendering issues across repeated compactions.
 - Fixed user-invoked skills failing to identify themselves or resolve relative paths across various execution paths.
+- Fixed type errors introduced by the merge sweep: restored the ask row-budget priority field, narrowed dereferenced schema property access, and updated stale test API usage.
+- Fixed git clone and fetch being killed by the 5-minute local-command timeout; network transfers now use a separate 30-minute deadline, overridable per call.
+- Fixed the TUI collab guest (omp join) silently dropping host ask/selector UI requests; they now present through the standard dialog flow and round-trip responses, with cancellation and resync replay handled.
+- Fixed transcript rebuilds (theme change, /shake, focus replay) showing stale streamed write/edit/eval content by sharing the partial-JSON decode between the live streaming path and every rebuild path.
+- Fixed an explicitly configured compaction.reserveTokens equal to the built-in default being silently replaced by the proportional small-window fallback; the setting now defaults to unset and explicit values are always honored.
+- Fixed user-configured LiteLLM discovery providers keeping stale reseller display-name suffixes for up to 24 hours after upgrade by invalidating the warm model cache.
+- Fixed `mergeTaskBranches` and `applyNestedPatches` leaving stage 1/2/3 unmerged entries in `.git/index` when the post-merge stash pop conflicted with the cherry-picked HEAD. The corrupted index survived indefinitely and every subsequent overlay-isolated task inherited it through the lower layer, causing `captureRepoDeltaPatch` to emit `diff --cc` output that `git apply` rejects with "No valid patches in input". The stash restore now runs behind a 3-way preflight check (`git apply --3way --check`) and a `reset --hard HEAD` cleanup fallback; the stash entry is preserved for manual recovery on conflict, and the merged commits still land on HEAD. ([#4175](https://github.com/can1357/oh-my-pi/issues/4175))
+- Fixed macOS `Command+V` image pastes in Ghostty by binding the Kitty `super+v` key event to the image-paste action alongside `Ctrl+V`. ([#4178](https://github.com/can1357/oh-my-pi/issues/4178))
 
 ## [16.2.13] - 2026-07-01
 
@@ -79,6 +109,7 @@
 
 - Fixed `models.yml` remote compaction schema support for V2 streaming endpoint fields. ([#4146](https://github.com/can1357/oh-my-pi/issues/4146))
 - Fixed the SSH tool to reject `cwd` values of `~` and `~/...` before sending guaranteed-bad quoted tilde paths to remote POSIX shells. ([#4002](https://github.com/can1357/oh-my-pi/issues/4002))
+- Status line token throughput segment now uses a dedicated tachometer icon (`icon.throughput`) instead of reusing the output arrow; cache read/write segments use a single database icon instead of stacking input/output arrows alongside it.
 
 ## [16.2.12] - 2026-07-01
 

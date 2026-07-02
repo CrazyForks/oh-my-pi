@@ -1347,6 +1347,8 @@ export interface BuildResponsesInputOptions<TApi extends Api> {
 	includeThinkingSignatures?: boolean;
 	developerStringContent?: boolean;
 	repairOrphanOutputs?: boolean;
+	/** Preserve assistant message item IDs from text signatures during fallback replay. */
+	preserveAssistantMessageIds?: boolean;
 }
 
 export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInputOptions<TApi>): ResponseInput {
@@ -1435,6 +1437,7 @@ export function buildResponsesInput<TApi extends Api>(options: BuildResponsesInp
 				knownCallIds,
 				includeThinkingSignatures,
 				customCallIds,
+				options.preserveAssistantMessageIds,
 			);
 			if (outputItems.length === 0) continue;
 			messages.push(...outputItems);
@@ -1478,6 +1481,7 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 	knownCallIds: Set<string>,
 	includeThinkingSignatures = true,
 	customCallIds?: Set<string>,
+	preserveMessageIds = false,
 ): ResponseInput {
 	const outputItems: ResponseInput = [];
 	let unsignedTextBlocks = 0;
@@ -1510,7 +1514,11 @@ export function convertResponsesAssistantMessage<TApi extends Api>(
 					msgId = unsignedTextBlocks === 0 ? `msg_${msgIndex}` : `msg_${msgIndex}_${unsignedTextBlocks}`;
 					unsignedTextBlocks += 1;
 				}
-			} else if (!hasReplayableReasoningItem && msgId.startsWith("msg_")) {
+			} else if (!preserveMessageIds && !hasReplayableReasoningItem) {
+				// Without the matching reasoning item the server rejects replayed
+				// item ids (#4173) — drop them regardless of shape, including
+				// legacy plain-string signatures that would otherwise fall into
+				// the >64-char hash branch and fabricate a bogus msg_ id.
 				msgId = undefined;
 			} else if (msgId.length > 64) {
 				msgId = `msg_${Bun.hash(msgId).toString(36)}`;
@@ -2439,7 +2447,7 @@ export function applyResponsesCompatPolicy<P extends ResponseCreateParamsStreami
 				ReasoningParam;
 			return 0;
 		}
-		if (policy.compat.requiresJuiceZeroHack && reasoning.requestedEffort === undefined) {
+		if (policy.compat.requiresReasoningSuppressionPrompt && reasoning.requestedEffort === undefined) {
 			messages.push({
 				role: "developer",
 				content: [{ type: "input_text", text: RESPONSES_REASONING_SUPPRESSION_PROMPT }],
@@ -2471,7 +2479,7 @@ export function applyResponsesCompatPolicy<P extends ResponseCreateParamsStreami
 		return 0;
 	}
 
-	if (policy.compat.requiresJuiceZeroHack) {
+	if (policy.compat.requiresReasoningSuppressionPrompt) {
 		messages.push({
 			role: "developer",
 			content: [{ type: "input_text", text: RESPONSES_REASONING_SUPPRESSION_PROMPT }],

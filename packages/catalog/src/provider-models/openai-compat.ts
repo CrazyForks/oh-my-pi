@@ -9,7 +9,7 @@ import { isGlmVisionModelId, isGrokReasoningEffortCapable, isReasoningGlmModelId
 import type { ModelManagerOptions } from "../model-manager";
 import { getBundledModels } from "../models";
 import type { Api, FetchImpl, Model, ModelSpec, OpenAICompat, Provider, ThinkingConfig } from "../types";
-import { isAnthropicOAuthToken, isRecord, toBoolean, toNumber, toPositiveNumber } from "../utils";
+import { discoveryFetch, isAnthropicOAuthToken, isRecord, toBoolean, toNumber, toPositiveNumber } from "../utils";
 import { coreWeaveProjectHeaders } from "../wire/coreweave";
 import {
 	COPILOT_API_HEADERS,
@@ -81,7 +81,7 @@ function toInputCapabilities(value: unknown): ("text" | "image")[] {
 	return supportsImage ? ["text", "image"] : ["text"];
 }
 
-async function fetchModelsDevPayload(fetchImpl: FetchImpl = fetch): Promise<unknown> {
+async function fetchModelsDevPayload(fetchImpl: FetchImpl = discoveryFetch()): Promise<unknown> {
 	const response = await fetchImpl(MODELS_DEV_URL, {
 		method: "GET",
 		headers: { Accept: "application/json" },
@@ -270,7 +270,7 @@ function toOllamaNativeBaseUrl(baseUrl: string): string {
 async function fetchOllamaNativeModels(
 	baseUrl: string,
 	resolveMetadata: (modelId: string) => Promise<OllamaResolvedMetadata>,
-	fetchImpl: FetchImpl = fetch,
+	fetchImpl: FetchImpl = discoveryFetch(),
 ): Promise<ModelSpec<"openai-responses">[] | null> {
 	const nativeBaseUrl = toOllamaNativeBaseUrl(baseUrl);
 	let response: Response;
@@ -376,7 +376,7 @@ function getOllamaThinkingConfig(capabilities: string[] | undefined): ThinkingCo
 async function fetchOllamaShowMetadata(
 	nativeBaseUrl: string,
 	modelId: string,
-	fetchImpl: FetchImpl = fetch,
+	fetchImpl: FetchImpl = discoveryFetch(),
 ): Promise<OllamaShowMetadata | undefined> {
 	try {
 		const response = await fetchImpl(`${nativeBaseUrl}/api/show`, {
@@ -743,7 +743,7 @@ async function fetchUmansModelsInfo(options: {
 	if (options.apiKey) {
 		requestHeaders["x-api-key"] = options.apiKey;
 	}
-	const fetchImpl = options.fetch ?? fetch;
+	const fetchImpl = discoveryFetch(options.fetch);
 	let payload: unknown;
 	try {
 		const response = await fetchImpl(`${discoveryBaseUrl}${UMANS_MODELS_INFO_PATH}`, {
@@ -1541,7 +1541,7 @@ async function fetchFireworksServerlessModels(options: {
 }): Promise<ModelSpec<"openai-completions">[] | null> {
 	const listUrl = toFireworksControlPlaneModelsUrl(options.baseUrl, FIREWORKS_CONTROL_PLANE_ACCOUNT);
 	if (!listUrl) return null;
-	const fetchImpl = options.fetch ?? fetch;
+	const fetchImpl = discoveryFetch(options.fetch);
 	const collected = new Map<string, ModelSpec<"openai-completions">>();
 	let pageToken = "";
 	for (let page = 0; page < FIREWORKS_CONTROL_PLANE_MAX_PAGES; page++) {
@@ -3079,7 +3079,7 @@ async function fetchLiteLLMRichEndpoint<TApi extends Api>(
 	runtimeBaseUrl: string,
 	signal?: AbortSignal,
 ): Promise<ModelSpec<TApi>[] | null> {
-	const fetchImpl = options.fetch ?? globalThis.fetch;
+	const fetchImpl = discoveryFetch(options.fetch);
 	const requestHeaders: Record<string, string> = {
 		Accept: "application/json",
 		...options.headers,
@@ -3153,7 +3153,11 @@ export function litellmModelManagerOptions(
 	const baseUrl = config?.baseUrl ?? Bun.env.LITELLM_BASE_URL ?? "http://localhost:4000/v1";
 	return {
 		providerId: "litellm",
-		cacheProviderId: `litellm:rich-v1:${Bun.hash(baseUrl).toString(36)}`,
+		// rich-v2 invalidates rows cached before reseller usage-suffix stripping
+		// (stale display names like `MiniMax-M3 (3x usage)`); bump the version
+		// whenever the mappers below change, or warm authoritative caches keep
+		// serving pre-change rows for the full TTL.
+		cacheProviderId: `litellm:rich-v2:${Bun.hash(baseUrl).toString(36)}`,
 		// litellm is a local-only proxy and is never bundled in models.json (that
 		// would leak the machine's localhost catalog). Prefer the proxy's richer
 		// management metadata, then fall back to /v1/models and enrich bare ids

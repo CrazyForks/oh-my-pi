@@ -117,10 +117,18 @@ export interface RestoreOptions {
 	readonly worktree?: boolean;
 }
 
+export interface FetchOptions {
+	readonly signal?: AbortSignal;
+	/** Deadline for the network transfer. Defaults to {@link GIT_NETWORK_TIMEOUT_MS}. */
+	readonly timeoutMs?: number;
+}
+
 export interface CloneOptions {
 	readonly ref?: string;
 	readonly sha?: string;
 	readonly signal?: AbortSignal;
+	/** Deadline for the network transfer. Defaults to {@link GIT_NETWORK_TIMEOUT_MS}. */
+	readonly timeoutMs?: number;
 }
 
 interface GitHeadBase extends GitRepository {
@@ -199,6 +207,13 @@ const GH_NON_INTERACTIVE_ENV = {
 
 /** Default deadline for git and gh subprocesses spawned by the coding agent. */
 export const GIT_COMMAND_TIMEOUT_MS = 5 * 60 * 1000;
+/**
+ * Default deadline for git subprocesses that perform network transfers
+ * (`clone`/`fetch`). Large-repo transfers legitimately outlive
+ * {@link GIT_COMMAND_TIMEOUT_MS}, so they get a wider deadline; local plumbing
+ * commands keep the short one.
+ */
+export const GIT_NETWORK_TIMEOUT_MS = 30 * 60 * 1000;
 /** Maximum captured stdout or stderr bytes retained from git and gh subprocesses. */
 export const GIT_COMMAND_OUTPUT_LIMIT_BYTES = 8 * 1024 * 1024;
 
@@ -208,9 +223,9 @@ const GIT_COMMAND_TERMINATE_GRACE_MS = 5_000;
 
 type CommandName = "git" | "gh";
 
-function resolveTimeoutMs(timeoutMs: number | undefined): number {
-	if (timeoutMs === undefined) return GIT_COMMAND_TIMEOUT_MS;
-	if (!Number.isFinite(timeoutMs) || timeoutMs < 0) return GIT_COMMAND_TIMEOUT_MS;
+function resolveTimeoutMs(timeoutMs: number | undefined, fallback: number = GIT_COMMAND_TIMEOUT_MS): number {
+	if (timeoutMs === undefined) return fallback;
+	if (!Number.isFinite(timeoutMs) || timeoutMs < 0) return fallback;
 	return Math.trunc(timeoutMs);
 }
 
@@ -1337,15 +1352,18 @@ export async function checkout(cwd: string, ref: string, signal?: AbortSignal): 
 	await runEffect(cwd, ["checkout", ref], { signal });
 }
 
-/** Fetch a specific refspec from a remote. */
+/** Fetch a specific refspec from a remote. Network transfer: defaults to the {@link GIT_NETWORK_TIMEOUT_MS} deadline. */
 export async function fetch(
 	cwd: string,
 	remote: string,
 	source: string,
 	target: string,
-	signal?: AbortSignal,
+	options: FetchOptions = {},
 ): Promise<void> {
-	await runEffect(cwd, ["fetch", remote, `+${source}:${target}`], { signal });
+	await runEffect(cwd, ["fetch", remote, `+${source}:${target}`], {
+		signal: options.signal,
+		timeoutMs: resolveTimeoutMs(options.timeoutMs, GIT_NETWORK_TIMEOUT_MS),
+	});
 }
 
 /** Read a tree-ish into the index. */
@@ -1732,6 +1750,69 @@ export const stash = {
 		if (options?.index) args.push("--index");
 		await runEffect(cwd, args);
 	},
+	/**
+	 * Return the working-tree patch that `stash@{0}` would apply, in a form
+	 * that `git apply --check` can consume. Empty string when no stash entry
+	 * exists or the stash contains no diffable working-tree changes.
+	 */
+	async showPatch(cwd: string): Promise<string> {
+		return (await tryText(cwd, ["stash", "show", "-p", "--binary", "stash@{0}"], { readOnly: true })) ?? "";
+	},
+	/** Return untracked paths stored in the top stash entry. */
+	async untrackedFiles(cwd: string): Promise<string[]> {
+		const output = await tryText(cwd, ["ls-tree", "-r", "-z", "--name-only", "stash@{0}^3"], { readOnly: true });
+		return output?.split("\0").filter(Boolean) ?? [];
+	},
+	/**
+	 * Attempt to restore the top stash entry. On success returns `true` and
+	 * git drops the stash entry. On conflict returns `false`, leaves the stash
+	 * entry preserved for manual resolution, and guarantees the failed restore
+	 * leaves no unmerged index entries or partially-restored untracked files.
+	 *
+	 * The historical raw `pop` catches the failure in a `finally` block and
+	 * only logs — it leaves `.git/index` with stage 1/2/3 unmerged entries
+	 * that survive indefinitely, corrupting every subsequent overlay-isolated
+	 * task that reads through this repo's `.git/`. See issue #4175.
+	 */
+	async tryPop(cwd: string, options?: { index?: boolean }): Promise<boolean> {
+		// Preflight: `git stash pop` internally does a 3-way merge, so a plain
+		// `git apply --check` is too strict — it rejects hunks whose context
+		// drifted from HEAD even when 3-way merge would resolve them cleanly.
+		// Match pop's semantics with `--3way --check`, which succeeds iff the
+		// patch either applies directly or merges without conflict against
+		// the patch's `index abc..def` base blobs.
+		const workingPatch = await stash.showPatch(cwd);
+		if (workingPatch.trim() && !(await patch.canApplyText(cwd, workingPatch, { threeWay: true }))) {
+			return false;
+		}
+		const restoredUntracked = await stash.untrackedFiles(cwd);
+		try {
+			await stash.pop(cwd, options);
+			return true;
+		} catch {
+			// Preflight can still miss mode-only or delete/modify conflicts. If
+			// the pop left unmerged entries, wipe them: HEAD holds the merged
+			// state so `reset --hard HEAD` restores a clean index and working
+			// tree without losing the cherry-picked commits. A failed pop can
+			// still restore unrelated untracked files before exiting while
+			// preserving the stash entry, so clean only the untracked paths
+			// recorded in that stash. The user's WIP remains recoverable via
+			// `git stash pop`.
+			try {
+				await reset(cwd, { hard: true });
+			} catch {
+				/* best-effort cleanup — do not mask the primary conflict */
+			}
+			if (restoredUntracked.length > 0) {
+				try {
+					await clean(cwd, { includeIgnored: true, literalPathspecs: true, paths: restoredUntracked });
+				} catch {
+					/* best-effort cleanup — do not mask the primary conflict */
+				}
+			}
+			return false;
+		}
+	},
 };
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1755,7 +1836,10 @@ export async function clone(url: string, targetDir: string, options: CloneOption
 	args.push(url, absoluteTarget);
 
 	try {
-		await runEffect(path.dirname(absoluteTarget), args, { signal: options.signal });
+		await runEffect(path.dirname(absoluteTarget), args, {
+			signal: options.signal,
+			timeoutMs: resolveTimeoutMs(options.timeoutMs, GIT_NETWORK_TIMEOUT_MS),
+		});
 		if (options.sha) {
 			try {
 				await checkout(absoluteTarget, options.sha, options.signal);
@@ -1798,9 +1882,18 @@ export async function reset(
 
 export async function clean(
 	cwd: string,
-	options: { ignoredOnly?: boolean; paths?: readonly string[]; signal?: AbortSignal } = {},
+	options: {
+		ignoredOnly?: boolean;
+		includeIgnored?: boolean;
+		literalPathspecs?: boolean;
+		paths?: readonly string[];
+		signal?: AbortSignal;
+	} = {},
 ): Promise<void> {
-	const args = ["clean", options.ignoredOnly ? "-fdX" : "-fd"];
+	const args = [options.literalPathspecs ? "--literal-pathspecs" : undefined, "clean"].filter(
+		(arg): arg is string => arg !== undefined,
+	);
+	args.push(options.ignoredOnly ? "-fdX" : options.includeIgnored ? "-fdx" : "-fd");
 	if (options.paths?.length) args.push("--", ...options.paths);
 	await runEffect(cwd, args, { signal: options.signal });
 }

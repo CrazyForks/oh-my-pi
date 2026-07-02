@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed legacy Pi extension loading to reuse source already read while building the source graph, avoiding a duplicate disk read for each own-source module on startup. ([#4196](https://github.com/can1357/oh-my-pi/issues/4196))
+
 ## [16.3.0] - 2026-07-02
 
 ### Added

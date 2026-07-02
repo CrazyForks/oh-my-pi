@@ -901,14 +901,15 @@ async function realpathOrSelf(p: string): Promise<string> {
 
 /**
  * Walk the extension's relative-import graph starting at `entryRealPath`,
- * returning the realpath of every reachable source module. Only relative
- * specifiers (`./`, `../`) are followed — bare and absolute imports are left to
- * Bun's native resolver — so the set is exactly the extension's own source,
- * wherever it physically lives (a `../src` sibling, a symlinked sub-tree, …).
- * This mirrors the module set the old temp-dir mirror tracked, minus the copy.
+ * returning each reachable source module's realpath and already-read source.
+ * Only relative specifiers (`./`, `../`) are followed — bare and absolute
+ * imports are left to Bun's native resolver — so the map is exactly the
+ * extension's own source, wherever it physically lives (a `../src` sibling,
+ * a symlinked sub-tree, …). This mirrors the module set the old temp-dir mirror
+ * tracked, minus the copy.
  */
-async function collectExtensionModules(entryRealPath: string): Promise<Set<string>> {
-	const modules = new Set<string>();
+async function collectExtensionModules(entryRealPath: string): Promise<Map<string, string>> {
+	const modules = new Map<string, string>();
 	const queue = [entryRealPath];
 	while (queue.length > 0) {
 		const file = queue.pop();
@@ -921,7 +922,7 @@ async function collectExtensionModules(entryRealPath: string): Promise<Set<strin
 		} catch {
 			continue;
 		}
-		modules.add(file);
+		modules.set(file, source);
 		const dir = path.dirname(file);
 		for (const match of source.matchAll(EXTENSION_GRAPH_SPECIFIER_REGEX)) {
 			const specifier = match[1];
@@ -956,14 +957,18 @@ async function ensureExtensionGraphHook(entryRealPath: string): Promise<void> {
 	}
 	hookedExtensionEntries.add(entryRealPath);
 
-	const modules = await collectExtensionModules(entryRealPath);
-	const alternation = [...modules].map(escapeRegExp).join("|");
+	const moduleSources = await collectExtensionModules(entryRealPath);
+	const alternation = [...moduleSources.keys()].map(escapeRegExp).join("|");
 	const filter = new RegExp(`^(?:${alternation})$`);
 	Bun.plugin({
 		name: `omp:legacy-pi-ext:${Bun.hash(entryRealPath).toString(36)}`,
 		setup(build) {
 			build.onLoad({ filter, namespace: "file" }, async args => {
-				const raw = await Bun.file(args.path).text();
+				const hasCachedSource = moduleSources.has(args.path);
+				const raw = hasCachedSource ? (moduleSources.get(args.path) ?? "") : await Bun.file(args.path).text();
+				if (hasCachedSource) {
+					moduleSources.delete(args.path);
+				}
 				return { contents: await rewriteLegacyExtensionSource(raw, args.path), loader: getLoader(args.path) };
 			});
 		},

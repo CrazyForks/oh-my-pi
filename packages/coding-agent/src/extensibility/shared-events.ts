@@ -42,7 +42,7 @@ export interface SessionBeforeSwitchEvent {
 export interface SessionSwitchEvent {
 	type: "session_switch";
 	/** Reason for the switch */
-	reason: "new" | "resume" | "fork";
+	reason: "new" | "resume" | "fork" | "handoff";
 	/** Session file we came from */
 	previousSessionFile: string | undefined;
 }

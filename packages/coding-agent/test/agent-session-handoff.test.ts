@@ -158,6 +158,72 @@ describe("AgentSession handoff", () => {
 		expect(sessionManager.getEntries().filter(entry => entry.type === "compaction")).toHaveLength(0);
 	});
 
+	it("emits a handoff session_switch before replacing the outgoing session", async () => {
+		const extensionsResult = await loadExtensions([], tempDir.path());
+		const extensionRunner = new ExtensionRunner(
+			extensionsResult.extensions,
+			extensionsResult.runtime,
+			tempDir.path(),
+			sessionManager,
+			modelRegistry,
+		);
+		const observedSwitches: Array<{
+			reason: string;
+			previousSessionFile: string | undefined;
+			activeSessionFile: string | undefined;
+			messageCount: number;
+		}> = [];
+		const emit = extensionRunner.emit.bind(extensionRunner);
+		vi.spyOn(extensionRunner, "emit").mockImplementation(event => {
+			if (event.type === "session_switch") {
+				observedSwitches.push({
+					reason: event.reason,
+					previousSessionFile: event.previousSessionFile,
+					activeSessionFile: session.sessionFile,
+					messageCount: sessionManager.getBranch().filter(entry => entry.type === "message").length,
+				});
+			}
+			return emit(event);
+		});
+
+		await session.dispose();
+		session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					model,
+					systemPrompt: ["Test"],
+					tools: [],
+					messages: [],
+				},
+			}),
+			sessionManager,
+			settings: Settings.isolated({
+				"compaction.enabled": true,
+				"compaction.autoContinue": false,
+			}),
+			modelRegistry,
+			extensionRunner,
+			obfuscator,
+		});
+		const previousSessionFile = session.sessionFile;
+		const generateHandoffSpy = vi
+			.spyOn(compactionModule, "generateHandoffFromContext")
+			.mockResolvedValue("## Goal\nContinue from here");
+
+		await session.handoff();
+
+		expect(generateHandoffSpy).toHaveBeenCalledTimes(1);
+		expect(observedSwitches).toEqual([
+			{
+				reason: "handoff",
+				previousSessionFile,
+				activeSessionFile: previousSessionFile,
+				messageCount: 2,
+			},
+		]);
+		expect(session.sessionFile).not.toBe(previousSessionFile);
+	});
+
 	it("runs handoff generation through the configured side stream function", async () => {
 		const handoffText = "## Goal\nContinue via side stream";
 		let sideStreamCalls = 0;

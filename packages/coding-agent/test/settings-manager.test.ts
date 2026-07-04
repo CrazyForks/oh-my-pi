@@ -175,6 +175,29 @@ describe("Settings", () => {
 			expect(settings.get("disabledProviders")).toEqual(["always-provider", "other-provider"]);
 		});
 
+		it("clears path-scoped provider cache before reloading project settings for a new cwd", async () => {
+			const otherDir = path.join(tempDir.toString(), "other-project");
+			fs.mkdirSync(getProjectAgentDir(otherDir), { recursive: true });
+			await Bun.write(
+				path.join(getProjectAgentDir(otherDir), "settings.json"),
+				JSON.stringify({ terminal: { showProgress: true } }),
+			);
+			await writeSettings({
+				disabledExtensionProviders: [
+					{ pathPrefix: projectDir, providers: ["native"] },
+					{ pathPrefix: otherDir, providers: [] },
+				],
+			});
+
+			const settings = await Settings.init({ cwd: projectDir, agentDir });
+			expect(settings.get("disabledExtensionProviders")).toEqual(["native"]);
+
+			await settings.reloadForCwd(otherDir);
+
+			expect(settings.get("disabledExtensionProviders")).toEqual([]);
+			expect(settings.get("terminal.showProgress")).toBe(true);
+		});
+
 		it("migrates legacy snapcompact system prompt booleans to scoped modes", () => {
 			expect(Settings.isolated({ "snapcompact.systemPrompt": true }).get("snapcompact.systemPrompt")).toBe("all");
 			const nestedLegacy = { snapcompact: { systemPrompt: false } } as Partial<Record<SettingPath, unknown>>;

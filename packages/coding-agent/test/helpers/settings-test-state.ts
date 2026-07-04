@@ -1,4 +1,5 @@
 import { vi } from "bun:test";
+import { resetProviderStateForTests } from "@oh-my-pi/pi-coding-agent/capability";
 import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { isTuiTight, setTuiTight } from "@oh-my-pi/pi-tui";
 import { getAgentDir, getProjectDir, setAgentDir, setProjectDir } from "@oh-my-pi/pi-utils";
@@ -25,12 +26,14 @@ export function beginSettingsTest(): SettingsTestState {
 		tuiTight: isTuiTight(),
 	};
 	resetSettingsForTest();
+	resetProviderStateForTests();
 	return state;
 }
 
 export function restoreSettingsTestState(state: SettingsTestState | undefined): void {
 	vi.restoreAllMocks();
 	resetSettingsForTest();
+	resetProviderStateForTests();
 	if (!state) return;
 
 	restoreEnv(state.env);

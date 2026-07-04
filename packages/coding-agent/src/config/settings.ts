@@ -477,6 +477,12 @@ export class Settings {
 		const normalized = path.normalize(cwd);
 		if (normalized === this.#cwd) return;
 		this.#cwd = normalized;
+		// `#loadProjectSettings()` uses the capability registry, whose provider
+		// filter reads path-scoped settings such as `disabledExtensionProviders`.
+		// Clear cwd-derived cached values before discovery so provider filtering
+		// resolves against the destination cwd instead of the previous project.
+		this.#resolvedCache.clear();
+		this.#editVariantCache = undefined;
 		if (this.#persist) {
 			this.#project = await this.#loadProjectSettings();
 		}

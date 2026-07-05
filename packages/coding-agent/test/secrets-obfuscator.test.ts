@@ -317,6 +317,36 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(obfuscator.deobfuscate(obfuscated)).toBe(input);
 	});
 
+	it("rejects a friendlyName that is a case/punctuation variant of its own secret, but still applies unrelated friendly names", () => {
+		// `#friendlyNameCollidesWithSecret` used to compare the sanitized (uppercased,
+		// alnum-only) friendly name against each secret's RAW value, so a friendlyName
+		// that was merely a case/punctuation variant of its own secret (e.g.
+		// "GitHub_Pat_Abc123" labeling "github_pat_abc123") slipped through: sanitizing
+		// the label produced "GITHUBPATABC123", which never literally appears inside the
+		// lowercase, underscored raw secret string. The fix sanitizes the secret value
+		// the same way before comparing, so this exact-content-under-normalization case
+		// is now caught and the secret falls back to a bare placeholder — while a
+		// genuinely unrelated friendly name is untouched and still gets its prefix.
+		const collidingSecret = "github_pat_abc123";
+		const collidingObfuscator = new SecretObfuscator([
+			{ type: "plain", content: collidingSecret, friendlyName: "GitHub_Pat_Abc123" },
+		]);
+		const collidingObfuscated = collidingObfuscator.obfuscate(collidingSecret);
+
+		expect(collidingObfuscated).not.toMatch(/GITHUBPATABC123_/);
+		expect(collidingObfuscated).toMatch(/^#[A-Z0-9]+:L#$/);
+		expect(collidingObfuscator.deobfuscate(collidingObfuscated)).toBe(collidingSecret);
+
+		const distinctSecret = "github_pat_xyz789";
+		const distinctObfuscator = new SecretObfuscator([
+			{ type: "plain", content: distinctSecret, friendlyName: "GitHub Token" },
+		]);
+		const distinctObfuscated = distinctObfuscator.obfuscate(distinctSecret);
+
+		expect(distinctObfuscated).toMatch(/^#GITHUBTOKEN_[A-Z0-9]+:L#$/);
+		expect(distinctObfuscator.deobfuscate(distinctObfuscated)).toBe(distinctSecret);
+	});
+
 	it("uses regex entry friendly names for discovered matches", () => {
 		const secret = "tok_abc123";
 		const obfuscator = new SecretObfuscator([{ type: "regex", content: "tok_[a-z0-9]+", friendlyName: "API Key" }]);
@@ -1413,34 +1443,24 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(obf.obfuscate(out)).toBe(out);
 	});
 
-	it("never emits a <=2 char match unchanged when no same-length value avoids the regex", () => {
-		// A match-everything regex has no nonmatching same-length redaction, so the
-		// search exhausts. The fallback must still differ from a <=2 char value that
-		// happens to equal `#generateReplacement`'s own `Z`/`ZZ` sentinel (else the
-		// raw secret would ship unchanged) while staying a fixed point under
-		// re-obfuscation. Such a config redacts every character and is pathological
-		// by construction.
-		for (const content of [".", "[\\s\\S]"]) {
+	it("drops a replace regex entirely when it can never redact a 1-2 char match distinctly from itself", () => {
+		// A match-everything regex has no nonmatching same-length redaction for a
+		// 1-2 char value, so `findNonMatchingReplacement` would exhaust even against
+		// an isolated probe drawn from the fallback's own alphabet — the regex has
+		// already proven it matches literally every candidate that alphabet could
+		// produce. Accepting the entry would mean the only "redaction" available is
+		// the raw match returned unchanged, which is worse than not registering the
+		// entry at all. The constructor now drops such entries silently at
+		// construction (`regexHasUnresolvableShortMatchFallback`), so with no other
+		// configured secret, `hasSecrets()` is false and the input passes through
+		// completely unobfuscated.
+		for (const content of [".", "[\\s\\S]", "[\\s\\S]{2}"]) {
 			const obf = new SecretObfuscator([{ type: "regex", mode: "replace", content }], "Q".repeat(43));
+			const input = content === "[\\s\\S]{2}" ? "ZZ" : "Z";
 
-			const out = obf.obfuscate("Z");
-
-			expect(out).not.toBe("Z");
-			expect(out).toHaveLength(1);
-			expect(obf.obfuscate(out)).toBe(out);
+			expect(obf.hasSecrets()).toBe(false);
+			expect(obf.obfuscate(input)).toBe(input);
 		}
-	});
-
-	it("never emits a 2-char match unchanged when no same-length value avoids the regex", () => {
-		// Same pathology as above, sized to hit the `ZZ` half of `#generateReplacement`'s
-		// sentinel rather than the `Z` half.
-		const obf = new SecretObfuscator([{ type: "regex", mode: "replace", content: "[\\s\\S]{2}" }], "Q".repeat(43));
-
-		const out = obf.obfuscate("ZZ");
-
-		expect(out).not.toBe("ZZ");
-		expect(out).toHaveLength(2);
-		expect(obf.obfuscate(out)).toBe(out);
 	});
 
 	it("resolves a three-character match-everything regex without the removed exhaustive sweep", () => {
@@ -2469,6 +2489,26 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 			expect(obfuscated).toMatch(/#[A-Z0-9]+:L#/);
 			expect(obfuscated).not.toMatch(/_[A-Z0-9]+/);
 			expect(obfuscator.deobfuscate(obfuscated)).toBe("non-string-friendly-secret");
+		} finally {
+			await fs.rm(root, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a secrets.yml replace regex entry that can never redact a 1-2 char match distinctly from itself", async () => {
+		const root = await fs.mkdtemp(path.join(os.tmpdir(), "omp-secret-friendly-"));
+		try {
+			const project = path.join(root, "project");
+			const agentDir = path.join(root, "agent");
+			await fs.mkdir(path.join(project, ".omp"), { recursive: true });
+			await fs.mkdir(agentDir, { recursive: true });
+			await fs.writeFile(
+				path.join(project, ".omp", "secrets.yml"),
+				'- type: regex\n  mode: replace\n  content: "."\n',
+			);
+
+			const entries = await loadSecrets(project, agentDir);
+
+			expect(entries).toEqual([]);
 		} finally {
 			await fs.rm(root, { recursive: true, force: true });
 		}

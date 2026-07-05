@@ -206,6 +206,33 @@ function findWhitespaceFallbackReplacement(
 	return undefined;
 }
 
+/**
+ * Whether a default (no custom `replacement`) replace-mode regex can never
+ * safely redact a 1-2 char match: `findNonMatchingReplacement`'s bounded
+ * search — the same search `#generateRegexReplacement` runs at match time —
+ * finds no candidate the regex fails to re-match. This holds independent of
+ * any actual per-install key: the search already exhausts every character in
+ * `REPLACEMENT_CHARS` (the alphabet `buildKeyedReplacementRun` draws its
+ * fallback marker from) plus punctuation and whitespace, so if none of those
+ * escape the regex, no key-derived marker drawn from the same alphabet can
+ * either — the marker is guaranteed to re-match too, making every such match
+ * unresolvable: the fallback could only ever emit the raw matched text
+ * unchanged. Probed with a value (`"\0".repeat(length)`) the bounded search
+ * never treats as a real candidate, so the result depends only on the
+ * regex's own matching behavior, not on this specific probe.
+ */
+export function regexHasUnresolvableShortMatchFallback(regex: RegExp): boolean {
+	return ([1, 2] as const).some(length => {
+		const probe = "\u0000".repeat(length);
+		const savedLastIndex = regex.lastIndex;
+		try {
+			return findNonMatchingReplacement(probe, regex, { text: probe, start: 0, end: length }) === undefined;
+		} finally {
+			regex.lastIndex = savedLastIndex;
+		}
+	});
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Placeholder format
 // ═══════════════════════════════════════════════════════════════════════════
@@ -586,9 +613,24 @@ export class SecretObfuscator {
 				continue;
 			}
 			try {
+				const regex = compileSecretRegex(entry.content, entry.flags);
+				const mode = entry.mode ?? "obfuscate";
+				// A default (no custom `replacement`) replace-mode regex that can
+				// never redact a 1-2 char match distinctly from itself (see
+				// `regexHasUnresolvableShortMatchFallback`) is dropped rather than
+				// risk a real secret round-tripping unredacted; `secrets/index.ts`
+				// warns loudly for the `secrets.yml`-loaded path — this is the
+				// silent backstop for direct construction.
+				if (
+					mode === "replace" &&
+					entry.replacement === undefined &&
+					regexHasUnresolvableShortMatchFallback(regex)
+				) {
+					continue;
+				}
 				this.#regexEntries.push({
-					regex: compileSecretRegex(entry.content, entry.flags),
-					mode: entry.mode ?? "obfuscate",
+					regex,
+					mode,
 					replacement: entry.replacement,
 					friendlyName: entry.friendlyName,
 				});
@@ -938,6 +980,16 @@ export class SecretObfuscator {
 	 * than a universal constant — the same class of accepted risk
 	 * `generateDeterministicReplacement`'s hash collision already carries for longer
 	 * values.
+	 * A regex that is UNCONDITIONALLY pathological for a length <= 2 — matching
+	 * literally every candidate in isolation, independent of context, like `.`
+	 * or `[\s\S]` — is now rejected at construction/config-load time instead
+	 * (see `regexHasUnresolvableShortMatchFallback`), since for that narrow
+	 * case the residual risk above is fully avoidable rather than merely
+	 * unlikely. This branch, and the residual risk above, still applies to a
+	 * length > 2 pathological config and to a length <= 2 pattern that is only
+	 * pathological in a SPECIFIC match's surrounding context (the
+	 * construction-time check tests the regex in isolation, not every context
+	 * it could appear in).
 	 */
 	#generateRegexReplacement(value: string, regex: RegExp, context: RegexMatchContext): string {
 		let replacement = generateDeterministicReplacement(value);
@@ -1106,13 +1158,17 @@ export class SecretObfuscator {
 	// verbatim, model-visible prefix on every placeholder minted for THIS
 	// secret, baked in via an exact `#deobfuscateMap` entry rather than the
 	// alias fallback — so it needs its own check independent of the scan-skip
-	// alias guard in `#isGeneratedPlaceholder`. Reject when the label contains
-	// a configured plain secret's literal value, or when any configured regex
-	// pattern matches the label — either means that text is meant to be
-	// redacted, not stamped unredacted onto every use of this secret.
+	// alias guard in `#isGeneratedPlaceholder`. Reject when the label contains a
+	// sanitized (alnum-only, uppercased) form of a configured plain secret's
+	// value — the same normalization already applied to the label itself, so a
+	// lowercase or punctuated secret cannot smuggle itself through case or
+	// separator noise — or when any configured regex pattern matches the label
+	// — either means that text is meant to be redacted, not stamped unredacted
+	// onto every use of this secret.
 	#friendlyNameCollidesWithSecret(name: string): boolean {
 		for (const secretValue of this.#configuredSecretValues) {
-			if (secretValue.length > 0 && name.includes(secretValue)) return true;
+			const sanitizedSecret = secretValue.replace(/[^A-Za-z0-9]/g, "").toUpperCase();
+			if (sanitizedSecret.length > 0 && name.includes(sanitizedSecret)) return true;
 		}
 		for (const entry of this.#regexEntries) {
 			entry.regex.lastIndex = 0;

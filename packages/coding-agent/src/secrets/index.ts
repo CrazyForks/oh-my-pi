@@ -3,7 +3,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { getAgentDir, isEnoent, logger } from "@oh-my-pi/pi-utils";
 import { YAML } from "bun";
-import { type SecretEntry, sanitizeSecretFriendlyName } from "./obfuscator";
+import { regexHasUnresolvableShortMatchFallback, type SecretEntry, sanitizeSecretFriendlyName } from "./obfuscator";
 import { compileSecretRegex } from "./regex";
 
 const PLACEHOLDER_KEY_RE = /^[A-Za-z0-9_-]{43}$/;
@@ -216,14 +216,23 @@ function validateEntry(entry: unknown, filePath: string, index: number): entry i
 		return false;
 	}
 	if (e.type === "regex") {
+		let regex: RegExp;
 		try {
-			compileSecretRegex(e.content as string, e.flags as string | undefined);
+			regex = compileSecretRegex(e.content as string, e.flags as string | undefined);
 		} catch (error) {
 			logger.warn(`secrets.yml[${index}]: invalid regex pattern`, {
 				path: filePath,
 				pattern: e.content,
 				error: String(error),
 			});
+			return false;
+		}
+		const mode = (e.mode as "obfuscate" | "replace" | undefined) ?? "obfuscate";
+		if (mode === "replace" && e.replacement === undefined && regexHasUnresolvableShortMatchFallback(regex)) {
+			logger.warn(
+				`secrets.yml[${index}]: regex matches every 1-2 character candidate with no custom replacement, so a match can never be redacted distinctly from itself`,
+				{ path: filePath, pattern: e.content },
+			);
 			return false;
 		}
 	}

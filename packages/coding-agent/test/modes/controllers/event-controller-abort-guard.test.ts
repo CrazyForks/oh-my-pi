@@ -1,13 +1,16 @@
 /**
- * Regression test for the abort-guard on `EventController.sendCompletionNotification`.
+ * Regression tests for `EventController`'s post-turn desktop notifications
+ * (`sendCompletionNotification` / `sendErrorNotification`).
  *
- * Bug: a user Ctrl+C on the `ask` tool selector throws `ToolAbortError`,
- * the turn ends with `stopReason === "aborted"`, and `#handleAgentEnd`
- * fires `sendCompletionNotification()`. Without a guard this produced a
- * misleading "Task complete" desktop toast for a turn that never actually
- * completed. The fix mirrors the `stopReason !== "aborted"` pattern already
- * used by `#currentContextTokens`, `#handleMessageEnd`, and the
- * retry / TTSR / compaction skip paths in `agent-session.ts`.
+ * Both read the settled turn's outcome from the `agent_end` event's own
+ * `messages`, not the mutable `viewSession` active context: a classifier-
+ * refusal failure ends with `stopReason === "error"` but is pruned from
+ * active context before the public `agent_end` fires (see
+ * `#removeAssistantMessageFromActiveContext` in `agent-session.ts`), and a
+ * user Ctrl+C on the `ask` tool selector similarly leaves `stopReason ===
+ * "aborted"` on the terminal message. Reading the mutable context for either
+ * check risks a stale/absent lookup — dropping the intended notification, or
+ * worse, pairing a misleading "Complete" toast with an error/abort.
  */
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
@@ -49,16 +52,11 @@ function makeAssistantMessage(stopReason: StopReason): AssistantMessage {
 	} as unknown as AssistantMessage;
 }
 
-function makeContext(lastMessage: AssistantMessage | undefined): InteractiveModeContext {
-	const sessionMock = {
-		getLastAssistantMessage: () => lastMessage,
-	};
+function makeContext(): InteractiveModeContext {
 	return {
 		sessionManager: {
 			getSessionName: () => "test-session",
 		},
-		session: sessionMock,
-		viewSession: sessionMock,
 	} as unknown as InteractiveModeContext;
 }
 
@@ -94,46 +92,46 @@ function makeTurnEndContext(options: { lastAssistantMessage?: AssistantMessage }
 }
 
 describe("EventController.sendCompletionNotification — abort guard", () => {
-	it("skips notification when the last assistant message stopReason === 'aborted'", () => {
+	it("skips notification when the terminal assistant message stopReason === 'aborted'", () => {
 		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
 		settings.override("completion.notify", "on");
-		const controller = new EventController(makeContext(makeAssistantMessage("aborted")));
-		controller.sendCompletionNotification();
+		const controller = new EventController(makeContext());
+		controller.sendCompletionNotification(makeAgentEndEvent([makeAssistantMessage("aborted")]));
 		expect(spy).toHaveBeenCalledTimes(0);
 	});
 
-	it("skips notification when the last assistant message stopReason === 'error'", () => {
+	it("skips notification when the terminal assistant message stopReason === 'error'", () => {
 		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
 		settings.override("completion.notify", "on");
-		const controller = new EventController(makeContext(makeAssistantMessage("error")));
-		controller.sendCompletionNotification();
+		const controller = new EventController(makeContext());
+		controller.sendCompletionNotification(makeAgentEndEvent([makeAssistantMessage("error")]));
 		expect(spy).toHaveBeenCalledTimes(0);
 	});
 
 	it("fires notification when stopReason === 'stop' (normal completion)", () => {
 		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
 		settings.override("completion.notify", "on");
-		const controller = new EventController(makeContext(makeAssistantMessage("stop")));
-		controller.sendCompletionNotification();
+		const controller = new EventController(makeContext());
+		controller.sendCompletionNotification(makeAgentEndEvent([makeAssistantMessage("stop")]));
 		expect(spy).toHaveBeenCalledTimes(1);
 		// Completion now sends a structured notification (title=session, body="Complete").
 		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ body: "Complete", type: "completion" }));
 	});
 
-	it("fires notification when getLastAssistantMessage is absent (e.g. brand-new session)", () => {
-		// Defensive: optional-chain `?.()` returns undefined; treat as 'no abort flag', proceed.
+	it("fires notification when agent_end carries no assistant message (e.g. brand-new session)", () => {
+		// Defensive: `findLast` returns undefined; treat as 'no abort flag', proceed.
 		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
 		settings.override("completion.notify", "on");
-		const controller = new EventController(makeContext(undefined));
-		controller.sendCompletionNotification();
+		const controller = new EventController(makeContext());
+		controller.sendCompletionNotification(makeAgentEndEvent([]));
 		expect(spy).toHaveBeenCalledTimes(1);
 	});
 
 	it("honors the existing completion.notify=off gate", () => {
 		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
 		settings.override("completion.notify", "off");
-		const controller = new EventController(makeContext(makeAssistantMessage("stop")));
-		controller.sendCompletionNotification();
+		const controller = new EventController(makeContext());
+		controller.sendCompletionNotification(makeAgentEndEvent([makeAssistantMessage("stop")]));
 		expect(spy).toHaveBeenCalledTimes(0);
 	});
 });
@@ -146,7 +144,7 @@ describe("EventController.sendErrorNotification", () => {
 	it("fires an error notification when stopReason === 'error'", () => {
 		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
 		settings.override("error.notify", "on");
-		const controller = new EventController(makeContext(undefined));
+		const controller = new EventController(makeContext());
 		controller.sendErrorNotification(makeAgentEndEvent([makeAssistantMessage("error")]));
 		expect(spy).toHaveBeenCalledTimes(1);
 		expect(spy).toHaveBeenCalledWith(
@@ -154,24 +152,10 @@ describe("EventController.sendErrorNotification", () => {
 		);
 	});
 
-	it("reads the terminal turn from agent_end.messages, not the mutable active context", () => {
-		// A classifier-refusal failure is pruned from `viewSession`'s active
-		// context before `agent_end` fires (`#removeAssistantMessageFromActiveContext`
-		// in agent-session.ts), so `viewSession.getLastAssistantMessage()` here
-		// reflects a stale, non-error turn. The notification must still fire off
-		// the event's own `messages`, not that stale snapshot.
-		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
-		settings.override("error.notify", "on");
-		const controller = new EventController(makeContext(makeAssistantMessage("stop")));
-		controller.sendErrorNotification(makeAgentEndEvent([makeAssistantMessage("error")]));
-		expect(spy).toHaveBeenCalledTimes(1);
-		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ body: "Stopped with error", type: "error" }));
-	});
-
 	it("uses the last assistant message when agent_end carries multiple messages", () => {
 		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
 		settings.override("error.notify", "on");
-		const controller = new EventController(makeContext(undefined));
+		const controller = new EventController(makeContext());
 		controller.sendErrorNotification(
 			makeAgentEndEvent([makeAssistantMessage("stop"), makeAssistantMessage("error")]),
 		);
@@ -183,12 +167,12 @@ describe("EventController.sendErrorNotification", () => {
 		settings.override("error.notify", "off");
 		settings.override("completion.notify", "on");
 
-		const errorController = new EventController(makeContext(undefined));
+		const errorController = new EventController(makeContext());
 		errorController.sendErrorNotification(makeAgentEndEvent([makeAssistantMessage("error")]));
 		expect(spy).toHaveBeenCalledTimes(0);
 
-		const completionController = new EventController(makeContext(makeAssistantMessage("stop")));
-		completionController.sendCompletionNotification();
+		const completionController = new EventController(makeContext());
+		completionController.sendCompletionNotification(makeAgentEndEvent([makeAssistantMessage("stop")]));
 		expect(spy).toHaveBeenCalledTimes(1);
 		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ body: "Complete", type: "completion" }));
 	});
@@ -196,7 +180,7 @@ describe("EventController.sendErrorNotification", () => {
 	it("skips user-aborted turns", () => {
 		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
 		settings.override("error.notify", "on");
-		const controller = new EventController(makeContext(undefined));
+		const controller = new EventController(makeContext());
 		controller.sendErrorNotification(makeAgentEndEvent([makeAssistantMessage("aborted")]));
 		expect(spy).toHaveBeenCalledTimes(0);
 	});
@@ -204,23 +188,17 @@ describe("EventController.sendErrorNotification", () => {
 	it("skips normal completion turns", () => {
 		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
 		settings.override("error.notify", "on");
-		const controller = new EventController(makeContext(undefined));
+		const controller = new EventController(makeContext());
 		controller.sendErrorNotification(makeAgentEndEvent([makeAssistantMessage("stop")]));
 		expect(spy).toHaveBeenCalledTimes(0);
 	});
 });
 
-describe("EventController — error notification through the real turn-end path (#handleAgentEnd)", () => {
-	beforeEach(() => {
-		// Isolate the error-notification assertion from the pre-existing
-		// completion-notification side effect that also fires from
-		// `#finishAgentEnd` on every settled turn.
-		settings.override("completion.notify", "off");
-	});
-
-	it("fires when the dispatched turn settles with stopReason === 'error', even with a stale active-context snapshot", async () => {
+describe("EventController — notifications through the real turn-end path (#handleAgentEnd)", () => {
+	it("fires the error notification when the dispatched turn settles with stopReason === 'error', even with a stale active-context snapshot", async () => {
 		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
 		settings.override("error.notify", "on");
+		settings.override("completion.notify", "off");
 		// viewSession (active context) reports no assistant at all — the shape a
 		// classifier-refusal prune leaves behind — while the terminal agent_end
 		// event still carries the failed turn.
@@ -230,11 +208,26 @@ describe("EventController — error notification through the real turn-end path 
 		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ body: "Stopped with error", type: "error" }));
 	});
 
-	it("skips notification when the dispatched turn settles with stopReason === 'aborted'", async () => {
+	it("skips the error notification when the dispatched turn settles with stopReason === 'aborted'", async () => {
 		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
 		settings.override("error.notify", "on");
+		settings.override("completion.notify", "off");
 		const controller = new EventController(makeTurnEndContext());
 		await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("aborted")]));
 		expect(spy).not.toHaveBeenCalled();
+	});
+
+	it("fires only the error toast — never a paired 'Complete' toast — for one error-ending turn", async () => {
+		// Regression for the exact coupling bug: with both notify settings on,
+		// a classifier-refusal turn's stale active context must not let
+		// sendCompletionNotification's own stopReason check pass by reading a
+		// different (non-error) snapshot than sendErrorNotification just used.
+		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		settings.override("error.notify", "on");
+		settings.override("completion.notify", "on");
+		const controller = new EventController(makeTurnEndContext({ lastAssistantMessage: undefined }));
+		await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("error")]));
+		expect(spy).toHaveBeenCalledTimes(1);
+		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ body: "Stopped with error", type: "error" }));
 	});
 });

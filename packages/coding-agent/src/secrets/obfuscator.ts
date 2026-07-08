@@ -1262,7 +1262,7 @@ export class SecretObfuscator {
 		let simulated = text;
 		let simulatedOrigin = origin;
 		for (const entry of this.#regexEntries) {
-			if (entry.mode !== "replace" || entry.replacement === undefined) continue;
+			if (entry.mode !== "replace") continue;
 			entry.regex.lastIndex = 0;
 			const matches = this.#collectRegexMatches(
 				simulated,
@@ -1273,17 +1273,14 @@ export class SecretObfuscator {
 			);
 			entry.regex.lastIndex = 0;
 			if (matches.length === 0) continue;
-			for (const secretValue of this.#collectRegexSecretValues(entry.replacement)) {
-				values.add(secretValue);
-			}
 			for (const match of [...matches].sort((a, b) => b.start - a.start)) {
-				simulated = replaceRange(simulated, match.start, match.end, entry.replacement);
-				simulatedOrigin = replaceRange(
-					simulatedOrigin,
-					match.start,
-					match.end,
-					"I".repeat(entry.replacement.length),
-				);
+				const replacement = entry.replacement ?? match.defaultReplacement;
+				if (replacement === undefined) continue;
+				for (const secretValue of this.#collectRegexSecretValues(replacement)) {
+					values.add(secretValue);
+				}
+				simulated = replaceRange(simulated, match.start, match.end, replacement);
+				simulatedOrigin = replaceRange(simulatedOrigin, match.start, match.end, "I".repeat(replacement.length));
 			}
 			for (const secretValue of this.#collectRegexSecretValues(simulated)) {
 				values.add(secretValue);

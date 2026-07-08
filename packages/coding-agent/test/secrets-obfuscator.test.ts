@@ -562,6 +562,41 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(obfuscator.deobfuscate(obfuscated)).toBe("use OTHERSECRET and tok_abc123 now");
 	});
 
+	it("omits a plain secret's own friendly label that normalizes to a regex-protected value produced through a DEFAULT (no custom replacement) regex replace hop", () => {
+		// Regression: the forecast above only ever simulated CUSTOM-replacement
+		// regex replace entries (`entry.replacement !== undefined`). A DEFAULT
+		// replace-mode entry (no `replacement` configured) still produces
+		// deterministic output — `X` (one byte) always redacts to `Z` — and that
+		// output can itself be the trigger a LATER replace entry needs to fire.
+		// Here `X` -> `Z` is the default hop, and only `Z` -> `tok_abc123` (a
+		// second, custom-replacement entry) actually produces the
+		// `tok_[a-z0-9]+`-protected value. Skipping the default hop means the
+		// forecast never sees `Z` in the simulated text, so the second entry
+		// never matches and `tok_abc123` is never simulated — the plain secret's
+		// own friendlyName "TOKABC123" (which normalizes to that same value)
+		// wrongly survives into its placeholder. The forecast must simulate the
+		// default hop's own deterministic output too, not just custom
+		// replacements, before checking friendly labels.
+		const obfuscator = new SecretObfuscator([
+			{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
+			{ type: "regex", mode: "replace", content: "X" },
+			{ type: "regex", mode: "replace", content: "Z", replacement: "tok_abc123" },
+			{ type: "regex", content: "tok_[a-z0-9]+" },
+		]);
+		const input = "use OTHERSECRET and X now";
+		const obfuscated = obfuscator.obfuscate(input);
+
+		expect(obfuscated).not.toContain("TOKABC123_");
+		expect(obfuscated).not.toContain("OTHERSECRET");
+		expect(obfuscated).not.toContain("tok_abc123");
+		expect(obfuscated).toMatch(/^use #[A-Z0-9]{4,}:U# and #[A-Z0-9]{4,}:L# now$/);
+		// Deobfuscation restores the plain secret's placeholder to `OTHERSECRET`
+		// and the regex-discovered placeholder to the value actually matched
+		// (`tok_abc123`); the default `X` -> `Z` hop is one-way, so neither `X`
+		// nor the intermediate `Z` marker is ever restored.
+		expect(obfuscator.deobfuscate(obfuscated)).toBe("use OTHERSECRET and tok_abc123 now");
+	});
+
 	it("does not replace plain secrets inside generated friendly placeholders", () => {
 		const longSecret = "long-secret-token";
 		const prefixSecret = "TOKENABC";

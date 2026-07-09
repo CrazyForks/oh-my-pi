@@ -55,6 +55,11 @@ export interface BashResult {
 	workingDir?: string;
 }
 
+/** POSIX-safe variable name — gates which direnv unsets we inject into the
+ *  command line, so a hostile `.envrc` can't smuggle shell syntax through
+ *  `unset`. `.envrc` never produces non-identifier names in practice. */
+const SAFE_ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
 const shellSessions = new Map<string, Shell>();
 const brokenShellSessions = new Set<string>();
 const shellSessionQuarantines = new Map<string, Promise<unknown>>();
@@ -218,16 +223,30 @@ export async function executeBash(command: string, options?: BashExecutorOptions
 	const commandCwd = resolveShellCwd(options?.cwd);
 	// Load the repo's direnv/devenv env (cached per .envrc) so devenv tools land
 	// on PATH; the caller's explicit `env` still wins over direnv-provided values.
-	const direnvEnv =
+	// Thread the caller's signal + timeout so an aborted / short-timeout call
+	// can't hang on a cold `.envrc` load before the abort listener is installed.
+	const direnvDiff =
 		settings.get("bash.direnv") === "off"
 			? null
 			: await loadDirenvEnv(commandCwd ?? process.cwd(), {
-					timeoutMs: settings.get("bash.direnvLoadTimeoutMs"),
+					timeoutMs: Math.min(
+						settings.get("bash.direnvLoadTimeoutMs"),
+						options?.timeout ?? Number.POSITIVE_INFINITY,
+					),
+					signal: options?.signal,
 				});
-	const commandEnv = buildNonInteractiveEnv(direnvEnv ? { ...direnvEnv, ...options?.env } : options?.env);
+	const commandEnv = buildNonInteractiveEnv(direnvDiff ? { ...direnvDiff.set, ...options?.env } : options?.env);
+	// direnv can also *remove* inherited variables (a `.envrc` doing
+	// `unset AWS_PROFILE`). The per-command env overlay can only add/override, so
+	// prepend a real `unset` for those — unless the caller re-supplied the same
+	// var explicitly, in which case the caller wins.
+	const direnvUnsets = direnvDiff
+		? direnvDiff.unset.filter(name => !(options?.env && name in options.env) && SAFE_ENV_NAME.test(name))
+		: [];
+	const unsetPrefix = direnvUnsets.length > 0 ? `unset -v ${direnvUnsets.join(" ")}; ` : "";
 
 	// Apply command prefix if configured
-	const prefixedCommand = prefix ? `${prefix} ${command}` : command;
+	const prefixedCommand = `${unsetPrefix}${prefix ? `${prefix} ${command}` : command}`;
 	const finalCommand =
 		options?.useUserShell === true && !bashShell
 			? buildUserShellCommand(shell, args, prefixedCommand)

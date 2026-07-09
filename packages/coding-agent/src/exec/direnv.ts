@@ -72,27 +72,40 @@ async function runDirenv(
 	cwd: string,
 	timeoutMs: number,
 	env: Record<string, string>,
+	signal?: AbortSignal,
 ): Promise<{ exitCode: number; stdout: string }> {
+	// Bail on the caller's cancellation as well as the per-invocation cap so a
+	// cold `.envrc` load can't outlive an aborted / short-timeout bash call.
+	const abortSignal = signal
+		? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)])
+		: AbortSignal.timeout(timeoutMs);
 	const proc = Bun.spawn([bin, ...args], {
 		cwd,
 		env,
 		stdout: "pipe",
 		stderr: "pipe",
-		signal: AbortSignal.timeout(timeoutMs),
+		signal: abortSignal,
 	});
-	const stdout = await new Response(proc.stdout as ReadableStream<Uint8Array>).text();
+	// Drain stdout AND stderr concurrently: a cold `use devenv`/Nix load emits
+	// enough diagnostics to fill the stderr pipe and block the child forever if
+	// only stdout is read (it would then wait out `timeoutMs`).
+	const [stdout] = await Promise.all([
+		new Response(proc.stdout as ReadableStream<Uint8Array>).text(),
+		new Response(proc.stderr as ReadableStream<Uint8Array>).text(),
+	]);
 	const exitCode = await proc.exited;
 	return { exitCode, stdout };
 }
 
 /** Cache the parsed env per resolved `.envrc` + content hash, so the (possibly
  *  slow) first export is paid once and a changed `.envrc` re-loads. */
-const exportCache = new Map<string, Record<string, string>>();
+const exportCache = new Map<string, DirenvExportDiff>();
 
 /**
  * Resolve the nearest `.envrc` from `cwd`, auto-allow it, and return its
- * `direnv export` environment (set values only). Returns `null` when there is
- * no `.envrc`, `direnv` is not installed, or the export fails/times out.
+ * `direnv export` diff (variables to set, and variables direnv removes).
+ * Returns `null` when there is no `.envrc`, `direnv` is not installed, or the
+ * export fails/times out.
  *
  * Auto-allow is deliberate: OMP already runs the repository's own code, so its
  * `.envrc` is trusted under the same model rather than forcing a manual
@@ -100,8 +113,8 @@ const exportCache = new Map<string, Record<string, string>>();
  */
 export async function loadDirenvEnv(
 	cwd: string,
-	opts?: { timeoutMs?: number },
-): Promise<Record<string, string> | null> {
+	opts?: { timeoutMs?: number; signal?: AbortSignal },
+): Promise<DirenvExportDiff | null> {
 	const envrcPath = await findEnvrc(cwd);
 	if (!envrcPath) return null;
 	const bin = direnvBinary();
@@ -121,15 +134,15 @@ export async function loadDirenvEnv(
 	const timeoutMs = opts?.timeoutMs ?? DEFAULT_DIRENV_TIMEOUT_MS;
 	const env = cleanSpawnEnv();
 	try {
-		await runDirenv(bin, ["allow"], dir, timeoutMs, env);
-		const { exitCode, stdout } = await runDirenv(bin, ["export", "json"], dir, timeoutMs, env);
+		await runDirenv(bin, ["allow"], dir, timeoutMs, env, opts?.signal);
+		const { exitCode, stdout } = await runDirenv(bin, ["export", "json"], dir, timeoutMs, env, opts?.signal);
 		if (exitCode !== 0) {
 			logger.warn("direnv export failed", { dir, exitCode });
 			return null;
 		}
-		const { set } = parseDirenvExport(stdout);
-		exportCache.set(cacheKey, set);
-		return set;
+		const diff = parseDirenvExport(stdout);
+		exportCache.set(cacheKey, diff);
+		return diff;
 	} catch (err) {
 		logger.warn("direnv load failed", { dir, error: err instanceof Error ? err.message : String(err) });
 		return null;

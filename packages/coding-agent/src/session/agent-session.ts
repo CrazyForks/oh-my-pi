@@ -14081,6 +14081,23 @@ export class AgentSession {
 			}
 		}
 		if (classifierRefusal && !switchedModel) {
+			// A prior attempt in this saga already announced `auto_retry_start`
+			// (retryAttempt was incremented for each call to this method, so > 1
+			// means at least one earlier attempt started the loop) but this
+			// attempt is not going to retry — the saga must close with its own
+			// `auto_retry_end` so subscribers tracking retry-outstanding state
+			// (e.g. suppressing a duplicate error toast) don't stay latched on
+			// an announcement that never resolves.
+			if (this.#retryAttempt > 1) {
+				await this.#persistRetryLifecycleErrorMessage(message);
+				await this.#emitSessionEvent({
+					type: "auto_retry_end",
+					success: false,
+					attempt: this.#retryAttempt - 1,
+					finalError: errorMessage,
+				});
+				this.#clearPendingRecoveredRetryErrors();
+			}
 			this.#retryAttempt = 0;
 			this.#resolveRetry();
 			return false;
@@ -14090,6 +14107,17 @@ export class AgentSession {
 		// retrying the failing fast model for a hard router error that the generic
 		// classifier wouldn't retry — surface it instead.
 		if (options?.fireworksFastFallback && !switchedModel && !this.#isRetryableError(message)) {
+			// Same auto_retry_end backstop as the classifier-refusal branch above.
+			if (this.#retryAttempt > 1) {
+				await this.#persistRetryLifecycleErrorMessage(message);
+				await this.#emitSessionEvent({
+					type: "auto_retry_end",
+					success: false,
+					attempt: this.#retryAttempt - 1,
+					finalError: errorMessage,
+				});
+				this.#clearPendingRecoveredRetryErrors();
+			}
 			this.#retryAttempt = 0;
 			this.#resolveRetry();
 			return false;

@@ -785,6 +785,87 @@ describe("AgentSession retry fallback", () => {
 		]);
 	});
 
+	it("emits auto_retry_end when a mid-saga classifier refusal has no fallback to switch to", async () => {
+		// Regression: `#handleRetryableError`'s classifier-refusal branch used to
+		// return `false` without emitting `auto_retry_end` whenever no fallback
+		// model was available to switch to. A saga that already announced
+		// `auto_retry_start` on an earlier (non-refusal) attempt would then never
+		// get a matching `auto_retry_end` — leaving any subscriber tracking
+		// "retry outstanding" state (e.g. suppressing a duplicate error toast)
+		// latched open forever. With `retry.maxRetries: 2` and no fallback chain
+		// configured, the second attempt's classifier refusal hits that branch
+		// while `retryAttempt (2) <= maxRetries (2)`, so it can't fall through
+		// the pre-existing maxRetries-exceeded path (which already emits
+		// `auto_retry_end`) — isolating the branch this regression covers.
+		const primaryModel = getBundledModel("anthropic", "claude-sonnet-4-5");
+		if (!primaryModel) {
+			throw new Error("Expected bundled test model to exist");
+		}
+
+		const requestedModels: string[] = [];
+		const refusalMessage = "Refusal (cyber): Classifier declined this retried turn.";
+		const mock = createMockModel();
+		let calls = 0;
+		const agent = new Agent({
+			getApiKey: model => `${model.provider}-test-key`,
+			initialState: {
+				model: primaryModel,
+				systemPrompt: ["Test"],
+				tools: [],
+				messages: [],
+			},
+			streamFn: (model, context, options) => {
+				requestedModels.push(`${model.provider}/${model.id}`);
+				calls += 1;
+				if (calls === 1) {
+					mock.push({ throw: "overloaded_error: provider returned error 503" });
+				} else if (calls === 2) {
+					mock.push({
+						stopReason: "error",
+						stopDetails: { type: "refusal", category: "cyber", explanation: "Classifier declined." },
+						errorMessage: refusalMessage,
+					});
+				} else {
+					throw new Error(`Unexpected model call after the classifier refusal settled: call ${calls}`);
+				}
+				return mock.stream(model, context, options);
+			},
+		});
+
+		const settings = Settings.isolated({
+			"compaction.enabled": false,
+			"retry.baseDelayMs": 5,
+			"retry.maxRetries": 2,
+		});
+		settings.setModelRole("default", `${primaryModel.provider}/${primaryModel.id}`);
+
+		session = new AgentSession({
+			agent,
+			sessionManager: SessionManager.inMemory(),
+			settings,
+			modelRegistry,
+		});
+		const { retryStartEvents, retryEndEvents } = trackRetryEvents(session);
+
+		await session.prompt("Retry once, then hit a classifier refusal with no fallback");
+		await session.waitForIdle();
+
+		expect(requestedModels).toEqual([
+			`${primaryModel.provider}/${primaryModel.id}`,
+			`${primaryModel.provider}/${primaryModel.id}`,
+		]);
+		expect(retryStartEvents).toHaveLength(1);
+		expect(retryStartEvents[0]?.attempt).toBe(1);
+		expect(retryEndEvents).toEqual([
+			{
+				type: "auto_retry_end",
+				success: false,
+				attempt: 1,
+				finalError: refusalMessage,
+			},
+		]);
+	});
+
 	it("uses Google retry hints in quota errors before quota backoff", async () => {
 		const model = getBundledModel("google", "gemini-1.5-flash");
 		if (!model) {

@@ -86,10 +86,11 @@ function makeTurnEndContext(options: { lastAssistantMessage?: AssistantMessage }
 		ui: { requestRender: () => {}, requestComponentRender: () => {} },
 		chatContainer: { removeChild: () => {} },
 		statusContainer: { clear: () => {}, disposeChildren: () => {}, addChild: () => {} },
-		statusLine: { markActivityEnd: () => {} },
+		statusLine: { markActivityEnd: () => {}, markActivityStart: () => {} },
 		editor: { getText: () => "" },
 		sessionManager: { getSessionName: () => "test-session" },
 		clearPinnedError: () => {},
+		ensureLoadingAnimation: () => {},
 		showError: () => {},
 		session,
 		viewSession: session,
@@ -295,12 +296,42 @@ describe("EventController — error toast gated while auto-retry is pending", ()
 		expect(spy).not.toHaveBeenCalled();
 	});
 
-	it("does not get stuck suppressing forever when a later attempt short-circuits without a fresh auto_retry_end", async () => {
-		// A classifier refusal on a later attempt can return from
-		// `#handleRetryableError` without emitting a new `auto_retry_start` or
-		// `auto_retry_end` for that attempt. `sendErrorNotification` must still
-		// notify on that attempt's own (truly final) agent_end rather than stay
-		// suppressed indefinitely from the earlier retry attempt's pending flag.
+	it("keeps suppressing every agent_end that lands while a retry is outstanding, with no auto_retry_end in between", async () => {
+		// The wire-level `agent_end` is coalesced by `AgentSession` while a prompt
+		// is in flight (every mid-retry attempt supersedes the previous one), so
+		// this controller cannot use "have I seen an agent_end yet" to decide
+		// whether a retry settled — only `auto_retry_end` can. Two agent_ends
+		// landing back-to-back with no `auto_retry_end` between them must both
+		// stay suppressed.
+		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
+		settings.override("error.notify", "on");
+		settings.override("completion.notify", "off");
+		const controller = new EventController(makeTurnEndContext());
+
+		await controller.handleEvent({
+			type: "auto_retry_start",
+			attempt: 1,
+			maxAttempts: 3,
+			delayMs: 100,
+			errorMessage: "overloaded",
+		} as Extract<AgentSessionEvent, { type: "auto_retry_start" }>);
+		await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("error")]));
+		await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("error")]));
+		expect(spy).not.toHaveBeenCalled();
+
+		// Only once the lifecycle explicitly settles does the next agent_end notify.
+		await controller.handleEvent({
+			type: "auto_retry_end",
+			success: false,
+			attempt: 2,
+			finalError: "still overloaded",
+		} as Extract<AgentSessionEvent, { type: "auto_retry_end" }>);
+		await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("error")]));
+		expect(spy).toHaveBeenCalledTimes(1);
+		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ body: "Stopped with error", type: "error" }));
+	});
+
+	it("clears the pending flag defensively on the next agent_start, so a stuck saga cannot suppress a later turn", async () => {
 		const spy = vi.spyOn(TERMINAL, "sendNotification").mockImplementation(() => {});
 		settings.override("error.notify", "on");
 		settings.override("completion.notify", "off");
@@ -316,8 +347,9 @@ describe("EventController — error toast gated while auto-retry is pending", ()
 		await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("error")]));
 		expect(spy).not.toHaveBeenCalled();
 
-		// Next attempt's failure short-circuits with no auto_retry_end at all —
-		// its own agent_end is the true final settle.
+		// No auto_retry_end ever arrives for this saga, but a fresh agent_start
+		// (the next real turn) must not stay latched into permanent suppression.
+		await controller.handleEvent({ type: "agent_start" } as Extract<AgentSessionEvent, { type: "agent_start" }>);
 		await controller.handleEvent(makeAgentEndEvent([makeAssistantMessage("error")]));
 		expect(spy).toHaveBeenCalledTimes(1);
 		expect(spy).toHaveBeenCalledWith(expect.objectContaining({ body: "Stopped with error", type: "error" }));

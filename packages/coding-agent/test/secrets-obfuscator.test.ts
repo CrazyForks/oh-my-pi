@@ -3136,6 +3136,39 @@ describe("SecretObfuscator cross-turn cache stability", () => {
 		expect(JSON.stringify(obfuscateMessages(obfuscator, obfuscated))).toEqual(serialized);
 	});
 
+	it("includes assistant replay content in the batch regex collision pre-scan", () => {
+		const obfuscator = new SecretObfuscator([
+			{ type: "plain", content: "OTHERSECRET", friendlyName: "TOKABC123" },
+			{ type: "regex", content: "tok_[a-z0-9]+" },
+		]);
+		const messages: Message[] = [
+			{ role: "user", content: "first message carries OTHERSECRET", timestamp: 1 },
+			{
+				role: "assistant",
+				content: [{ type: "toolCall", id: "call-1", name: "read", arguments: { token: "tok_abc123" } }],
+				api: "anthropic-messages",
+				provider: "anthropic",
+				model: "test-model",
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				stopReason: "toolUse",
+				timestamp: 2,
+			},
+		];
+
+		const serialized = JSON.stringify(obfuscateMessages(obfuscator, messages));
+
+		expect(serialized).not.toContain("OTHERSECRET");
+		expect(serialized).not.toContain("tok_abc123");
+		expect(serialized).not.toContain("TOKABC123_");
+	});
+
 	it("collects regex-protected values across the whole tool-call argument payload before obfuscating any single string", () => {
 		// Regression: `obfuscateToolArguments` must precompute regex-protected
 		// values by walking the ENTIRE JSON argument object up front — the same
@@ -3451,7 +3484,13 @@ describe("SecretObfuscator cross-turn cache stability", () => {
 		const untouchedSuffix = " — that should still be correct.";
 		const assistantMessage: Message = {
 			role: "assistant",
-			content: [{ type: "thinking", thinking: `${untouchedPrefix}${mintedPlaceholder}${untouchedSuffix}` }],
+			content: [
+				{
+					type: "thinking",
+					thinking: `${untouchedPrefix}${mintedPlaceholder}${untouchedSuffix}`,
+					thinkingSignature: "signed-original-thinking",
+				},
+			],
 			api: "anthropic-messages",
 			provider: "anthropic",
 			model: "test-model",
@@ -3476,7 +3515,8 @@ describe("SecretObfuscator cross-turn cache stability", () => {
 		};
 
 		const result = obfuscateMessages(obfuscator, [assistantMessage, toolResultMessage]);
-		const strippedThinking = assistantThinking(result[0]).thinking;
+		const strippedThinkingBlock = assistantThinking(result[0]);
+		const strippedThinking = strippedThinkingBlock.thinking;
 		const redactedToolResultText = toolResultText(result[1]);
 
 		// The stale friendly prefix is gone from the thinking block, replaced by
@@ -3486,6 +3526,7 @@ describe("SecretObfuscator cross-turn cache stability", () => {
 		expect(strippedThinking).toContain(bareAlias);
 		expect(strippedThinking).toContain(untouchedPrefix);
 		expect(strippedThinking).toContain(untouchedSuffix);
+		expect(strippedThinkingBlock.thinkingSignature).toBeUndefined();
 
 		// The newly revealed raw secret is redacted in the tool result.
 		expect(redactedToolResultText).not.toContain("tok_abc123");

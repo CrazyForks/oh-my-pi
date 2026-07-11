@@ -25,7 +25,7 @@ import { $which, logger } from "@oh-my-pi/pi-utils";
 import { DEFAULT_SHARE_URL } from "@oh-my-pi/pi-wire";
 import { $ } from "bun";
 import { obfuscateToolArguments, type SecretObfuscator } from "../secrets/obfuscator";
-import type { SessionEntry, SessionHeader } from "../session/session-entries";
+import { type SessionEntry, type SessionHeader, TITLE_CHANGE_ENTRY_TYPE } from "../session/session-entries";
 import type { SessionManager } from "../session/session-manager";
 import type { OutputMeta } from "../tools/output-meta";
 import { buildSessionData, type SessionData, type SubSession } from "./html";
@@ -210,6 +210,11 @@ function collectShareRegexSecretValues(o: SecretObfuscator, data: SessionData): 
 			case "label":
 				add(entry.label);
 				return;
+			case TITLE_CHANGE_ENTRY_TYPE:
+				add(entry.title);
+				add(entry.previousTitle);
+				add(entry.trigger);
+				return;
 			default:
 				return;
 		}
@@ -319,6 +324,16 @@ function redactShareEntry(
 			return {
 				...entry,
 				label: entry.label === undefined ? undefined : o.obfuscate(entry.label, sharedRegexSecretValues),
+			};
+		case TITLE_CHANGE_ENTRY_TYPE:
+			return {
+				...entry,
+				title: o.obfuscate(entry.title, sharedRegexSecretValues),
+				previousTitle:
+					entry.previousTitle === undefined
+						? undefined
+						: o.obfuscate(entry.previousTitle, sharedRegexSecretValues),
+				trigger: entry.trigger === undefined ? undefined : o.obfuscate(entry.trigger, sharedRegexSecretValues),
 			};
 		default:
 			return entry;

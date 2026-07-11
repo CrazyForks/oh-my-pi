@@ -250,6 +250,76 @@ describe("buildShareSnapshot", () => {
 		expect(JSON.stringify(entries)).toContain(secret);
 	});
 
+	test("redacts every title-change field before sharing", () => {
+		const secret = "share-title-secret";
+		const entries: SessionEntry[] = [
+			{
+				type: "title_change",
+				id: "title-1",
+				parentId: null,
+				timestamp: "2026-06-12T00:00:00.000Z",
+				title: `new ${secret}`,
+				previousTitle: `old ${secret}`,
+				source: "user",
+				trigger: `rename ${secret}`,
+			} as SessionEntry,
+		];
+		const sm = {
+			getHeader: () => sessionData([], "x").header,
+			getEntries: () => entries,
+			getLeafId: () => "title-1",
+		} as unknown as SessionManager;
+		const snapshot = buildShareSnapshot(sm, {
+			obfuscator: new SecretObfuscator([{ type: "plain", content: secret }]),
+		});
+
+		expect(JSON.stringify(snapshot)).not.toContain(secret);
+		expect(JSON.stringify(entries)).toContain(secret);
+	});
+
+	test("includes every title-change field in the regex collision pre-scan", () => {
+		const plainTitle = "PLAIN_TITLE_SECRET";
+		const plainPreviousTitle = "PLAIN_PREVIOUS_TITLE_SECRET";
+		const plainTrigger = "PLAIN_TRIGGER_SECRET";
+		const friendlyTitle = "TOKTITLEABC";
+		const friendlyPreviousTitle = "TOKPREVABC";
+		const friendlyTrigger = "TOKTRIGGERABC";
+		const entries: SessionEntry[] = [
+			{
+				type: "title_change",
+				id: "title-1",
+				parentId: null,
+				timestamp: "2026-06-12T00:00:00.000Z",
+				title: "tok_title_abc",
+				previousTitle: "tok_prev_abc",
+				source: "user",
+				trigger: "tok_trigger_abc",
+			} as SessionEntry,
+		];
+		const sm = {
+			getHeader: () => ({
+				...sessionData([], "x").header,
+				title: `${plainTitle} ${plainPreviousTitle} ${plainTrigger}`,
+			}),
+			getEntries: () => entries,
+			getLeafId: () => "title-1",
+		} as unknown as SessionManager;
+		const obfuscator = new SecretObfuscator([
+			{ type: "plain", content: plainTitle, friendlyName: friendlyTitle },
+			{ type: "plain", content: plainPreviousTitle, friendlyName: friendlyPreviousTitle },
+			{ type: "plain", content: plainTrigger, friendlyName: friendlyTrigger },
+			{ type: "regex", content: "tok_title_[a-z]+" },
+			{ type: "regex", content: "tok_prev_[a-z]+" },
+			{ type: "regex", content: "tok_trigger_[a-z]+" },
+		]);
+
+		const flat = JSON.stringify(buildShareSnapshot(sm, { obfuscator }));
+
+		expect(flat).not.toContain(friendlyTitle);
+		expect(flat).not.toContain(friendlyPreviousTitle);
+		expect(flat).not.toContain(friendlyTrigger);
+	});
+
 	test("collects regex-protected values across the whole snapshot so an earlier field's friendly-name placeholder cannot leak a later field's secret", () => {
 		// `buildShareSnapshot` must precompute regex-matched secret values across the ENTIRE
 		// snapshot (header + entries) before redacting any single field. Otherwise the header

@@ -2011,7 +2011,8 @@ function deobfuscateTextBlocks(
 
 /**
  * Re-obfuscate assistant content before it returns to a provider after session
- * restoration, then remove any friendly prefix made unsafe by this batch.
+ * restoration, removing friendly prefixes made unsafe by this batch. A changed
+ * thinking block loses its byte-bound replay signature.
  */
 function obfuscateAssistantContentForReplay(
 	obfuscator: SecretObfuscator,
@@ -2035,7 +2036,7 @@ function obfuscateAssistantContentForReplay(
 			const thinking = obfuscate(block.thinking);
 			if (thinking === block.thinking) return block;
 			changed = true;
-			return { ...block, thinking };
+			return { ...block, thinking, thinkingSignature: undefined };
 		}
 		if (block.type === "toolCall") {
 			const args = mapJsonStrings(block.arguments as JsonValue, obfuscate) as Record<string, unknown>;
@@ -2052,12 +2053,27 @@ function obfuscateAssistantContentForReplay(
 
 function collectMessageRegexSecretValues(obfuscator: SecretObfuscator, messages: Message[]): Set<string> {
 	const values = new Set<string>();
-	const addText = (text: string): void => {
+	const addText = (text: string | undefined): void => {
+		if (text === undefined) return;
 		for (const value of obfuscator.collectRegexSecretValuesForObfuscation(text)) {
 			values.add(value);
 		}
 	};
 	for (const message of messages) {
+		if (message.role === "assistant") {
+			for (const block of message.content) {
+				if (block.type === "text") addText(block.text);
+				else if (block.type === "thinking") addText(block.thinking);
+				else if (block.type === "toolCall") {
+					for (const value of collectJsonRegexSecretValues(obfuscator, block.arguments as JsonValue)) {
+						values.add(value);
+					}
+					addText(block.intent);
+					addText(block.rawBlock);
+				}
+			}
+			continue;
+		}
 		if (
 			message.role !== "user" &&
 			message.role !== "toolResult" &&

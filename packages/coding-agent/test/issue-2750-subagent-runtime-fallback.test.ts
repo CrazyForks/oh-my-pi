@@ -1,11 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import type { Api, Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
-import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
-import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
-import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
-import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
+import { Settings } from "../src/config/settings";
+import * as sdkModule from "../src/sdk";
+import type { AgentSession } from "../src/session/agent-session";
+import { runSubprocess } from "../src/task/executor";
+import type { AgentDefinition } from "../src/task/types";
 
 function model(provider: string, id: string): Model<Api> {
 	return buildModel({
@@ -30,6 +30,7 @@ function createYieldingSession(): AgentSession {
 		extensionRunner: undefined,
 		sessionManager: { appendSessionInit: () => {} },
 		getActiveToolNames: () => ["yield"],
+		getEnabledToolNames: () => ["yield"],
 		setActiveToolsByName: async () => {},
 		subscribe: (listener: (event: { type: string; [key: string]: unknown }) => void) => {
 			listeners.push(listener);
@@ -38,17 +39,17 @@ function createYieldingSession(): AgentSession {
 		prompt: async () => {
 			for (const listener of listeners) {
 				listener({
-					type: "retry_fallback_applied",
-					from: "primary/bad-runtime-model",
-					to: "fallback/working-model",
-					role: "subagent:issue-2750",
-				});
-				listener({
 					type: "tool_execution_end",
 					toolCallId: "tool-yield",
 					toolName: "yield",
 					result: { content: [{ type: "text", text: "Result submitted." }], details: { status: "success" } },
 					isError: false,
+				});
+				listener({
+					type: "retry_fallback_applied",
+					from: "primary/bad-runtime-model",
+					to: "fallback/working-model",
+					role: "subagent:issue-2750",
 				});
 			}
 		},

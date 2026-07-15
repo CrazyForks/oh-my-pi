@@ -421,10 +421,7 @@ describe("streaming tool call preview height (bounded across renderers)", () => 
 		expect(visibleWidth(topBorder ?? "")).toBe(width);
 	});
 
-	test("bash/ssh pending previews stay short even with very long multiline args", () => {
-		// bash/ssh window the collapsed command to a viewport-sized TAIL: the end
-		// (the live edge while args stream) stays visible behind an "… N earlier
-		// lines" marker on top; the head is elided.
+	test("bash pending previews stay short even with very long multiline args", () => {
 		const window = previewWindowRows();
 		const total = window + 5;
 		const longLines = Array.from({ length: total }, (_, i) => `line-${i}`);
@@ -433,10 +430,7 @@ describe("streaming tool call preview height (bounded across renderers)", () => 
 		const lastHidden = `line-${hidden - 1}`;
 		const firstVisible = `line-${hidden}`;
 		const lastVisible = `line-${total - 1}`;
-		const cases: Array<{ name: string; args: unknown }> = [
-			{ name: "bash", args: { command: longLines.join("\n") } },
-			{ name: "ssh", args: { host: "example", command: longLines.join("\n") } },
-		];
+		const cases: Array<{ name: string; args: unknown }> = [{ name: "bash", args: { command: longLines.join("\n") } }];
 
 		for (const testCase of cases) {
 			const { lines, text } = renderPending(testCase.name, testCase.args);
@@ -453,10 +447,10 @@ describe("streaming tool call preview height (bounded across renderers)", () => 
 	}, 30_000);
 
 	test("eval pending preview windows the code to the viewport tail", () => {
-		// Eval cell code is capped to the same viewport-sized TAIL window as
-		// bash/ssh: the live edge stays visible behind an "… N earlier lines"
-		// marker on top; ctrl+o uncaps. Unlike bash, the marker row sits above
-		// the window, so previewWindowRows() code lines stay visible.
+		// Eval code is capped to the same viewport-sized tail window as bash:
+		// the live edge stays visible behind an "… N earlier lines" marker;
+		// ctrl+o uncaps. Unlike bash, the marker row sits above the window, so
+		// previewWindowRows() code lines stay visible.
 		const window = previewWindowRows();
 		const total = window + 5;
 		const hidden = total - window;

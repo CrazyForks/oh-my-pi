@@ -15,7 +15,6 @@ import {
 } from "@oh-my-pi/pi-coding-agent/secrets";
 import {
 	deobfuscateAgentMessages,
-	deobfuscateAssistantContent,
 	deobfuscateSessionContext,
 	deobfuscateToolArguments,
 	obfuscateMessages,
@@ -2363,22 +2362,14 @@ describe("SecretObfuscator friendlyName placeholders", () => {
 		expect(first.deobfuscate(firstToken ?? "")).toBe("alpha-secret");
 	});
 
-	it("preserves legacy alias positions for skipped short plain secrets", () => {
+	it("keeps legacy aliases aligned with formerly obfuscated secrets", () => {
 		const obfuscator = new SecretObfuscator([
 			{ type: "plain", content: "abc" },
 			{ type: "plain", content: "MYSECRET123" },
 		]);
 
-		expect(obfuscator.deobfuscateStored("#XRRS#")).toBe("abc");
-		expect(obfuscator.deobfuscateStored("#NTJ5#")).toBe("MYSECRET123");
-	});
-	it("restores short-only legacy aliases from stored assistant content", () => {
-		const obfuscator = new SecretObfuscator([{ type: "plain", content: "abc" }]);
-		const content: AssistantMessage["content"] = [{ type: "text", text: "#XRRS#" }];
-
-		expect(obfuscator.hasSecrets()).toBe(false);
-		expect(obfuscator.deobfuscateStored("#XRRS#")).toBe("abc");
-		expect(deobfuscateAssistantContent(obfuscator, content, true)).toEqual([{ type: "text", text: "abc" }]);
+		expect(obfuscator.deobfuscateStored("#XRRS#")).toBe("MYSECRET123");
+		expect(obfuscator.deobfuscateStored("#NTJ5#")).toBe("#NTJ5#");
 	});
 
 	it("honors legacy index-derived aliases only on the stored-replay path", () => {

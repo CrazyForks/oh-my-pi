@@ -677,12 +677,6 @@ export class SecretObfuscator {
 			if (mode === "obfuscate") {
 				if (entry.content.length < MIN_OBFUSCATE_SECRET_LEN) {
 					// Tone down short plain secret obfuscation to avoid false matches on small words like "esp".
-					// Legacy aliases remain display-only, so preserve their historical positions.
-					this.#legacyDeobfuscateMap.set(buildLegacyPlaceholder(legacyIndex), {
-						secret: entry.content,
-						recursive: false,
-					});
-					legacyIndex++;
 					continue;
 				}
 				const placeholder = this.#createPlaceholder(entry.content, entry.friendlyName);

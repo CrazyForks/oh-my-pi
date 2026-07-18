@@ -11,6 +11,7 @@ import { TempDir } from "@oh-my-pi/pi-utils";
 import { type } from "arktype";
 import { ModelRegistry } from "../src/config/model-registry";
 import { InteractiveMode } from "../src/modes/interactive-mode";
+import { XdevRegistry } from "../src/tools/xdev";
 
 function makeTool(name: string): AgentTool {
 	return {
@@ -28,6 +29,7 @@ interface HarnessOptions {
 	extraRegistryTools?: readonly AgentTool[];
 	builtInToolNames?: Iterable<string>;
 	rebuildGate?: { fail: boolean; calls?: number };
+	xdevRegistry?: XdevRegistry;
 }
 
 describe("InteractiveMode plan.defaultOnStartup", () => {
@@ -85,6 +87,7 @@ describe("InteractiveMode plan.defaultOnStartup", () => {
 			toolRegistry.set(tool.name, tool);
 		}
 		const manager = SessionManager.create(tempDir.path(), path.join(tempDir.path(), `active-${Bun.nanoseconds()}`));
+		const xdevRegistry = options.xdevRegistry;
 		const createdSession = new AgentSession({
 			agent: new Agent({
 				initialState: {
@@ -107,6 +110,7 @@ describe("InteractiveMode plan.defaultOnStartup", () => {
 						return { systemPrompt: ["Test"] };
 					}
 				: undefined,
+			xdevRegistry,
 		});
 		session = createdSession;
 		mode = new InteractiveMode(createdSession, "test");
@@ -193,6 +197,50 @@ describe("InteractiveMode plan.defaultOnStartup", () => {
 		expect(created.planModeEnabled).toBe(false);
 		expect(session?.getPlanModeState()).toBeUndefined();
 		expect(session?.getActiveToolNames()).toEqual(["read"]);
+	});
+
+	it("restores mounted xd devices when prior-model restoration fails", async () => {
+		const settings = Settings.isolated({ "plan.defaultOnStartup": true, "compaction.enabled": false });
+		settings.setModelRole("plan", "anthropic/claude-haiku-4-5:high");
+		const writeTool = makeTool("write");
+		const mountedTool = { ...makeTool("ambient_search"), loadMode: "discoverable" as const };
+		const created = createHarness(settings, {
+			extraRegistryTools: [writeTool],
+			builtInToolNames: ["read", "write"],
+			xdevRegistry: new XdevRegistry([]),
+		});
+		const previousModel = session?.model;
+		await session!.refreshRpcHostTools([mountedTool]);
+		await created.init({ suppressWelcomeIntro: true });
+		const planModel = session?.model;
+		const planTools = session?.getEnabledToolNames();
+		expect(planModel?.id).toBe("claude-haiku-4-5");
+		expect(session?.configuredThinkingLevel()).toBe(Effort.High);
+		expect(session?.getMountedXdevToolNames()).toEqual([mountedTool.name]);
+
+		const setModelTemporary = session!.setModelTemporary.bind(session);
+		const restoreModel = vi.spyOn(session!, "setModelTemporary").mockImplementationOnce(async (...args) => {
+			await setModelTemporary(...args);
+			throw new Error("model restore failed after switch");
+		});
+		await expect(created.handlePlanModeCommand()).rejects.toThrow("model restore failed after switch");
+
+		expect(created.planModeEnabled).toBe(true);
+		expect(created.planModePaused).toBe(false);
+		expect(session?.getPlanModeState()?.enabled).toBe(true);
+		expect(session?.peekPlanProposalHandler()).toBeDefined();
+		expect(session?.model?.id).toBe(planModel?.id);
+		expect(session?.configuredThinkingLevel()).toBe(Effort.High);
+		expect(session?.getEnabledToolNames()).toEqual(planTools);
+		expect(session?.getMountedXdevToolNames()).toEqual([mountedTool.name]);
+
+		restoreModel.mockRestore();
+		await created.handlePlanModeCommand();
+		expect(created.planModeEnabled).toBe(false);
+		expect(session?.getPlanModeState()).toBeUndefined();
+		expect(session?.model?.id).toBe(previousModel?.id);
+		expect(session?.getEnabledToolNames()).toEqual(["read", "write", mountedTool.name]);
+		expect(session?.getMountedXdevToolNames()).toEqual([mountedTool.name]);
 	});
 
 	it("clears old plan UI state when target-session reconciliation restore fails", async () => {

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed Gemini Flash Cloud Code Assist responses containing only intercepted planning-leak JSON being counted as meaningful output, so fully discarded leaks now use the existing empty-response retry path while visible suffixes and native structured tool calls remain successful.
+
 ## [17.0.6] - 2026-07-20
 
 ### Fixed

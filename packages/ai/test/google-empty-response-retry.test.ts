@@ -235,6 +235,49 @@ describe("Google empty-response retry (Cloud Code Assist path)", () => {
 		void events;
 	});
 
+	it("retries after discarding a planning leak and delivers one structured function call", async () => {
+		let calls = 0;
+		const fetchMock: FetchImpl = async () => {
+			calls += 1;
+			const response =
+				calls === 1
+					? sse(ccaChunk('{\n  "thought": "inspect the project",\n  "call": "lookup"\n}'))
+					: sse({
+						response: {
+							candidates: [
+								{
+									content: {
+										parts: [{ functionCall: { name: "lookup", args: { q: "x" }, id: "call_1" } }],
+									},
+									finishReason: "STOP",
+								},
+							],
+						},
+					});
+			Object.defineProperty(response, "url", { value: "https://example.com/v1internal:streamGenerateContent" });
+			return response;
+		};
+
+		const stream = streamGoogleGeminiCli(cliModel, context, {
+			apiKey: JSON.stringify({ token: "token", projectId: "proj-123" }),
+			fetch: fetchMock,
+		});
+		const { events, starts } = await drain(stream);
+		const result = await stream.result();
+
+		expect(calls).toBe(2);
+		expect(starts).toBe(1);
+		expect(result.stopReason).toBe("toolUse");
+		expect(result.content).toHaveLength(1);
+		expect(result.content[0]).toMatchObject({
+			type: "toolCall",
+			id: "call_1",
+			name: "lookup",
+			arguments: { q: "x" },
+		});
+		expect(events.filter(e => e.type === "toolcall_start")).toHaveLength(1);
+	});
+
 	it("does not coalesce function-call thought signatures into the preceding text block", async () => {
 		const chunks = [
 			{ response: { candidates: [{ content: { parts: [{ text: "Done" }] } }] } },

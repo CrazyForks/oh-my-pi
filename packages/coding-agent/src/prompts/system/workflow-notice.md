@@ -47,7 +47,7 @@ For independent per-item chains (review → verify, fetch → extract → score)
             schema: FINDINGS_SCHEMA,
         });
         return await parallel(found.findings.map((f) => async () => ({
-            ...f,
+            …f,
             verdict: await agent(
                 `Refute if you can (default refuted when unsure): ${f.title}`,
                 { label: `verify:${f.file}`, schema: VERDICT_SCHEMA },
@@ -57,8 +57,6 @@ For independent per-item chains (review → verify, fetch → extract → score)
     phase("Review");
     const results = await parallel(DIMENSIONS.map((d) => async () => reviewAndVerify(d)));
     const confirmed = results.flat().filter((f) => f.verdict.is_real);
-
-
 Reach for `pipeline()` only when a stage genuinely needs ALL of the previous stage first — dedup/merge across the whole set, early-exit on zero, or "compare against the other findings" — because its inter-stage barrier makes every item wait for the slowest peer:
 
 **Python (`eval`, Python backend):**
@@ -80,8 +78,6 @@ Reach for `pipeline()` only when a stage genuinely needs ALL of the previous sta
     const verdicts = await parallel(findings.map((f) => async () =>
         await agent(verifyPrompt(f), { schema: VERDICT_SCHEMA }),
     ));
-
-
 Use ordinary code between calls to flatten/map/filter; don't add a barrier just for that. Nested `parallel()` pools each cap independently, so keep total fan-out sane.
 </structure>
 

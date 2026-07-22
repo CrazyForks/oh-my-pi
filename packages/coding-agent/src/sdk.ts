@@ -119,7 +119,7 @@ import {
 	obfuscateProviderContext,
 	SecretObfuscator,
 } from "./secrets";
-import { AgentSession, type PlanYolo, type Prewalk } from "./session/agent-session";
+import { AgentSession, type InitialRetryFallbackState, type PlanYolo, type Prewalk } from "./session/agent-session";
 import { discoverAuthStorage as discoverAuthStorageFromConfig } from "./session/auth-broker-config";
 import type { AuthStorage } from "./session/auth-storage";
 import { createInterruptedTurnAbortMessage } from "./session/exit-diagnostics";
@@ -1387,6 +1387,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 	);
 	let model = options.model;
 	let modelFallbackMessage: string | undefined;
+	let initialRetryFallback: InitialRetryFallbackState | undefined;
 	// Identify session model strings to restore in fallback order. We do an
 	// initial pass here so model-dependent setup (thinking-level resolution,
 	// host preconnect) can use the restored model; extension-registered
@@ -2085,9 +2086,12 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 						preferences: matchPreferences,
 					});
 					if (resolved.configuredPatterns && resolved.configuredPatterns.length > 0) {
-						const primaryPatterns = resolved.configuredPatterns.map(pattern => ({
+						const primaryPatterns: Array<{
+							pattern: string;
+							retryFallback: InitialRetryFallbackState | undefined;
+						}> = resolved.configuredPatterns.map(pattern => ({
 							pattern,
-							retryFallback: false,
+							retryFallback: undefined,
 						}));
 						if (!resolved.configuredRole || !settings.get("retry.modelFallback")) {
 							return primaryPatterns;
@@ -2097,11 +2101,22 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 							fallbackChains[resolved.configuredRole] ??
 							(resolved.configuredRole === "default" ? undefined : fallbackChains.default);
 						if (!Array.isArray(roleFallbacks)) return primaryPatterns;
+						const originalSelector = resolved.configuredPatterns[0];
+						const parsedOriginal = parseModelString(originalSelector, {
+							allowMaxSuffix: true,
+							allowAutoAlias: true,
+							isLiteralModelId: (provider, id) => modelRegistry.find(provider, id) !== undefined,
+						});
+						const retryFallback: InitialRetryFallbackState = {
+							role: resolved.configuredRole,
+							originalSelector,
+							originalThinkingLevel: parsedOriginal?.thinkingLevel,
+						};
 						return [
 							...primaryPatterns,
 							...roleFallbacks
 								.filter((pattern): pattern is string => typeof pattern === "string")
-								.map(pattern => ({ pattern, retryFallback: true })),
+								.map(pattern => ({ pattern, retryFallback })),
 						];
 					}
 					if (resolved.model) {
@@ -2111,13 +2126,13 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 									resolved.selector ?? formatModelStringWithRouting(resolved.model),
 									resolved.thinkingLevel,
 								),
-								retryFallback: false,
+								retryFallback: undefined,
 							},
 						];
 					}
 					return resolveConfiguredModelPatterns([trimmedSelector], settings).map(pattern => ({
 						pattern,
-						retryFallback: false,
+						retryFallback: undefined,
 					}));
 				}),
 			);
@@ -2197,6 +2212,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 					}
 				}
 				model = selectedModel;
+				initialRetryFallback = retryFallback;
 				modelFallbackMessage = undefined;
 				if (selectedExplicitThinkingLevel) {
 					restoredSessionThinkingLevel = selectedThinkingLevel;
@@ -2941,6 +2957,7 @@ export async function createAgentSession(options: CreateAgentSessionOptions = {}
 			agent,
 			pruneToolDescriptions: inlineToolDescriptors,
 			thinkingLevel: autoThinking ? AUTO_THINKING : effectiveThinkingLevel,
+			initialRetryFallback,
 			prewalk: options.prewalk,
 			planYolo: options.planYolo,
 			serviceTierByFamily: initialServiceTierByFamily,

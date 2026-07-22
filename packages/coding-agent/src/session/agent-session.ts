@@ -872,6 +872,16 @@ export interface PlanYolo {
 // Types
 // ============================================================================
 
+/** Identifies a retry fallback chain already entered during startup model resolution. */
+export interface InitialRetryFallbackState {
+	/** Role whose configured primary was unavailable. */
+	role: string;
+	/** Configured primary selector retained for restoration when it becomes available. */
+	originalSelector: string;
+	/** Thinking selector configured for the unavailable primary. */
+	originalThinkingLevel: ConfiguredThinkingLevel | undefined;
+}
+
 export interface AgentSessionConfig {
 	agent: Agent;
 	sessionManager: SessionManager;
@@ -882,6 +892,8 @@ export interface AgentSessionConfig {
 	scopedModels?: Array<{ model: Model; thinkingLevel?: ThinkingLevel }>;
 	/** Initial session thinking selector. */
 	thinkingLevel?: ConfiguredThinkingLevel;
+	/** Retry chain ownership when startup selected one of its fallback entries. */
+	initialRetryFallback?: InitialRetryFallbackState;
 	/** Prewalk from the starting model to a fast/cheap target at the first edit/write once the todo list exists. */
 	prewalk?: Prewalk;
 	/** Force read-only plan mode at start, auto-approve on the model's first
@@ -2697,6 +2709,13 @@ export class AgentSession {
 			this.#thinkingLevel = resolveProvisionalAutoLevel(this.model);
 		} else {
 			this.#thinkingLevel = config.thinkingLevel;
+		}
+		if (config.initialRetryFallback) {
+			this.#activeRetryFallback = {
+				...config.initialRetryFallback,
+				lastAppliedFallbackThinkingLevel: this.configuredThinkingLevel(),
+				pinned: false,
+			};
 		}
 		if (config.prewalk) {
 			this.#prewalk = config.prewalk;

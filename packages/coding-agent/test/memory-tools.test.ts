@@ -522,6 +522,41 @@ describe("Mnemopi backend lifecycle", () => {
 		expect(rows.map(row => row.retainedThroughUserTurn)).toEqual([2, 4, 6]);
 	});
 
+	it("does not over-count legacy cumulative resumed rows when restoring the cursor", async () => {
+		const entries = Array.from({ length: 8 }, (_, index) => ({
+			type: "message",
+			message: { role: "user", content: `turn ${index + 1}` },
+		}));
+		const config = makeMnemopiConfig({ retainEveryNTurns: 2 });
+		const seed = registerMnemopiState(config, { cwd: "/work/project-alpha" });
+		const turn = (index: number) => ({ role: "user", content: `turn ${index}` });
+		// Legacy pre-fix bank: two incremental rows plus a cumulative row written
+		// by a resumed session whose in-memory cursor had reset to zero. None of
+		// them carry retained_through_user_turn metadata.
+		await seed.retainMessages([turn(1), turn(2)], `${TEST_SESSION_ID}-1`);
+		await seed.retainMessages([turn(3), turn(4)], `${TEST_SESSION_ID}-2`);
+		await seed.retainMessages([turn(1), turn(2), turn(3), turn(4), turn(5), turn(6)], `${TEST_SESSION_ID}-3`);
+		await seed.dispose({ consolidate: false });
+
+		const resumed = registerMnemopiState(config, {
+			cwd: "/work/project-alpha",
+			entries: () => entries,
+		});
+		await resumed.maybeRetainOnAgentEnd([] as never);
+
+		const rows = resumed.memory.beam.db
+			.prepare<{ content: string }, [string]>(`
+				SELECT content
+				FROM working_memory
+				WHERE source = 'coding-agent-transcript'
+				  AND json_extract(metadata_json, '$.session_id') = ?
+				ORDER BY rowid
+			`)
+			.all(TEST_SESSION_ID);
+		expect(rows).toHaveLength(4);
+		expect(rows.at(-1)?.content.match(/turn \d+/g)).toEqual(["turn 7", "turn 8"]);
+	});
+
 	it("retains the full transcript but extracts and embeds clean projections", async () => {
 		const state = registerMnemopiState(makeMnemopiConfig(), { cwd: "/work/project-alpha" });
 		const rememberSpy = vi.spyOn(state, "rememberInScope").mockReturnValue("memory-id");

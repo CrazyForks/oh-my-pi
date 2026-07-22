@@ -173,22 +173,22 @@ function countRetainedUserTurns(transcript: string): number {
 }
 
 function deriveRetainedTurnCursor(rows: readonly MnemopiRetentionCursorRow[], sessionId: string): number {
-	let explicitCursor = 0;
-	let legacyIncrementalTurns = 0;
-	let legacySnapshotTurns = 0;
+	let cursor = 0;
 	for (const row of rows) {
 		if (Number.isInteger(row.retainedThroughUserTurn) && row.retainedThroughUserTurn !== null) {
-			explicitCursor = Math.max(explicitCursor, row.retainedThroughUserTurn);
+			cursor = Math.max(cursor, row.retainedThroughUserTurn);
 			continue;
 		}
-		const turns = countRetainedUserTurns(row.content);
-		if (row.sourceId === sessionId) {
-			legacySnapshotTurns = Math.max(legacySnapshotTurns, turns);
-		} else if (row.sourceId?.startsWith(`${sessionId}-`)) {
-			legacyIncrementalTurns += turns;
-		}
+		if (row.sourceId !== sessionId && !row.sourceId?.startsWith(`${sessionId}-`)) continue;
+		// Legacy rows carry no explicit cursor. Summing incremental rows looks
+		// right, but pre-fix resumed sessions also wrote cumulative rows under the
+		// incremental `${sessionId}-<ts>` id shape, so a sum can overshoot the real
+		// retained prefix and permanently skip unseen turns. Per-row max can only
+		// under-count, which at worst re-stores one suffix before an explicit
+		// cursor row takes over.
+		cursor = Math.max(cursor, countRetainedUserTurns(row.content));
 	}
-	return Math.max(explicitCursor, legacyIncrementalTurns, legacySnapshotTurns);
+	return cursor;
 }
 
 function sliceUnretainedMessages(

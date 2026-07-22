@@ -55,6 +55,9 @@
 - Fixed in-progress aborts awaiting `session_stop` extension handlers whose results would be discarded.
 - Fixed `/retry` reporting "Nothing to retry" after a stream stalled or aborted mid-tool-call.
 - Fixed locally consumed extension commands triggering automatic title generation and exposing their command text to the title model.
+### Fixed
+
+- Fixed compiled binaries failing to load legacy Pi extensions with minified imports, `pi-ai/compat`, or transitive runtime dependencies. The compatibility loader now follows compact static imports, resolves transitive on-disk ESM imports and CommonJS requires with package conditions, and restores the legacy `copyToClipboard` and `decodeKittyPrintable` root exports used by `pi-vimmode` and `pi-web-access`.
 
 ## [17.0.7] - 2026-07-21
 

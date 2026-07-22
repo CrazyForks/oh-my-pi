@@ -1,12 +1,34 @@
 /// <reference path="./legacy-pi-virtual-modules.d.ts" />
+
 import * as fs from "node:fs";
 import { createRequire, isBuiltin } from "node:module";
 import * as path from "node:path";
 import * as url from "node:url";
+import type { ParserPlugin } from "@babel/parser";
+import { parse as parseBabel } from "@babel/parser";
+import * as traverseModule from "@babel/traverse";
 import { isCompiledBinary, stripWindowsExtendedLengthPathPrefix } from "@oh-my-pi/pi-utils";
 import { registerPluginCacheInvalidator } from "../../discovery/helpers";
 
 const IS_COMPILED_BINARY = isCompiledBinary();
+
+function isBabelTraverse(value: unknown): value is typeof traverseModule.default {
+	return typeof value === "function";
+}
+
+// Bun's compiled CJS interop wraps Babel traverse's default one level deeper.
+const traverseDefault: unknown = traverseModule.default;
+const nestedTraverse =
+	traverseDefault !== null && typeof traverseDefault === "object" && "default" in traverseDefault
+		? traverseDefault.default
+		: undefined;
+const traverseCandidate = isBabelTraverse(traverseDefault) ? traverseDefault : nestedTraverse;
+if (!isBabelTraverse(traverseCandidate)) {
+	throw new TypeError(
+		`Invalid @babel/traverse export: expected function, got default=${typeof traverseDefault}, nested=${typeof nestedTraverse}`,
+	);
+}
+const traverseAst = traverseCandidate;
 
 // === Bundled host modules (issue #3423) ===
 //
@@ -40,6 +62,95 @@ interface LegacyPiResolveResult {
 interface BundledVirtualResolveResult {
 	path: string;
 	namespace: typeof BUNDLED_VIRTUAL_NAMESPACE;
+}
+
+interface ExtensionSpecifierReference {
+	readonly kind: "import" | "require";
+	readonly specifier: string;
+	readonly start: number;
+	readonly end: number;
+}
+
+function collectExtensionSpecifierReferences(source: string, importerPath: string): ExtensionSpecifierReference[] {
+	const extension = path.extname(importerPath).toLowerCase();
+	const plugins: ParserPlugin[] = ["decorators-legacy", "explicitResourceManagement"];
+	if (extension === ".ts" || extension === ".mts" || extension === ".cts" || extension === ".tsx") {
+		plugins.push("typescript");
+	}
+	if (extension === ".jsx" || extension === ".tsx") {
+		plugins.push("jsx");
+	}
+
+	const ast = (() => {
+		try {
+			return parseBabel(source, {
+				sourceType: "unambiguous",
+				allowAwaitOutsideFunction: true,
+				allowReturnOutsideFunction: true,
+				allowImportExportEverywhere: true,
+				allowNewTargetOutsideFunction: true,
+				allowSuperOutsideMethod: true,
+				allowUndeclaredExports: true,
+				errorRecovery: true,
+				plugins,
+			});
+		} catch (error) {
+			throw new Error(
+				`Failed to parse extension source for dependency rewriting: ${importerPath}: ${error instanceof Error ? error.message : String(error)}`,
+				{ cause: error },
+			);
+		}
+	})();
+
+	const references: ExtensionSpecifierReference[] = [];
+	const record = (kind: ExtensionSpecifierReference["kind"], literal: unknown): void => {
+		if (!literal || typeof literal !== "object") return;
+		const node = literal as { type?: string; value?: unknown; start?: number | null; end?: number | null };
+		if (
+			node.type === "StringLiteral" &&
+			typeof node.value === "string" &&
+			typeof node.start === "number" &&
+			typeof node.end === "number"
+		) {
+			references.push({ kind, specifier: node.value, start: node.start, end: node.end });
+		}
+	};
+	traverseAst(ast, {
+		enter(nodePath) {
+			const node = nodePath.node;
+			if (
+				node.type === "ImportDeclaration" ||
+				node.type === "ExportNamedDeclaration" ||
+				node.type === "ExportAllDeclaration"
+			) {
+				record("import", node.source);
+			} else if (node.type === "ImportExpression") {
+				record("import", node.source);
+			} else if (node.type === "CallExpression") {
+				if (node.callee.type === "Import") {
+					record("import", node.arguments[0]);
+				} else if (
+					node.callee.type === "Identifier" &&
+					node.callee.name === "require" &&
+					!nodePath.scope.hasBinding("require", true)
+				) {
+					record("require", node.arguments[0]);
+				}
+			}
+		},
+	});
+	return references;
+}
+
+function applySpecifierReplacements(
+	source: string,
+	replacements: ReadonlyArray<ExtensionSpecifierReference & { readonly replacement: string }>,
+): string {
+	let rewritten = source;
+	for (const reference of [...replacements].sort((left, right) => right.start - left.start)) {
+		rewritten = `${rewritten.slice(0, reference.start)}${JSON.stringify(reference.replacement)}${rewritten.slice(reference.end)}`;
+	}
+	return rewritten;
 }
 
 const loadedBundledModules: Record<string, BundledModule> = {};
@@ -180,6 +291,7 @@ const PI_PACKAGE_ALTERNATION = PI_PACKAGE_NAMES.join("|");
 const PI_SUBPATH_REMAPS: ReadonlyMap<string, string> = new Map<string, string>([
 	["pi-ai/utils/oauth", "pi-ai/oauth"],
 	["pi-ai/utils/oauth/", "pi-ai/oauth/"],
+	["pi-ai/compat", "pi-ai"],
 ]);
 
 function remapLegacyPiSubpath(rest: string): string {
@@ -198,18 +310,16 @@ function remapLegacyPiSubpath(rest: string): string {
 }
 
 const LEGACY_PI_SPECIFIER_FILTER = new RegExp(`^@(?:${PI_SCOPE_ALTERNATION})/(?:${PI_PACKAGE_ALTERNATION})(?:/.*)?$`);
-const LEGACY_PI_IMPORT_SPECIFIER_REGEX = new RegExp(
-	`((?:from\\s+|import\\s+|import\\s*\\(\\s*)["'])(@(?:${PI_SCOPE_ALTERNATION})/(?:${PI_PACKAGE_ALTERNATION})(?:/[^"'()\\s]+)?)(["'])`,
-	"g",
-);
 const resolvedSpecifierFallbacks = new Map<string, string>();
 const SOURCE_MODULE_EXTENSIONS = [".ts", ".tsx", ".mts", ".cts", ".js", ".jsx", ".mjs", ".cjs"] as const;
 const SUPPORTED_PACKAGE_IMPORT_CONDITIONS = new Set(["bun", "node", "import", "default"]);
+const SUPPORTED_PACKAGE_REQUIRE_CONDITIONS = new Set(["bun", "node", "require", "default"]);
 const packageRootCache = new Map<string, string | null>();
 const packageImportsCache = new Map<string, Record<string, unknown> | null>();
 const nodePackageRootCache = new Map<string, Promise<string | null>>();
 const packageManifestCache = new Map<string, Promise<Record<string, unknown> | null>>();
 const bareDependencyResolutionCache = new Map<string, Promise<string | null>>();
+const bareRequireResolutionCache = new Map<string, Promise<string | null>>();
 const realpathCache = new Map<string, Promise<string>>();
 const nativeAddonResolutionCache = new Map<string, Promise<string | null>>();
 const nativeAddonRequireScanCache = new Map<string, Promise<boolean>>();
@@ -222,6 +332,7 @@ function clearLegacyPiResolutionCaches(): void {
 	nodePackageRootCache.clear();
 	packageManifestCache.clear();
 	bareDependencyResolutionCache.clear();
+	bareRequireResolutionCache.clear();
 	nativeAddonResolutionCache.clear();
 	nativeAddonRequireScanCache.clear();
 	nativeAddonLoaderModulePaths.clear();
@@ -338,14 +449,21 @@ const LEGACY_PI_CODING_AGENT_SHIM_PATH = IS_COMPILED_BINARY
 	? bundledModuleVirtualSpecifier(`${CANONICAL_PI_SCOPE}/pi-coding-agent`)
 	: sourceShimPath("legacy-pi-coding-agent-shim.ts");
 
-// Package-root overrides. Shim entries (`pi-ai`, `pi-coding-agent`) always
-// replace the canonical surface so the legacy `Type` runtime and the legacy
-// helpers stay reachable. The bundled host packages (`pi-agent-core`,
-// `pi-natives`, `pi-tui`, `pi-utils`) are added only in compiled-binary mode
-// to route extensions onto the in-process module instance — in dev /
-// source-link / installed-package mode the canonical specifier resolves
-// cleanly through `Bun.resolveSync` and hardcoding a source-tree path would
-// miss installs where the bundled packages live at `node_modules/@oh-my-pi/pi-*`.
+// Legacy pi-tui exported `decodeKittyPrintable` from its package root. The
+// canonical TUI replaced it with the broader `decodePrintableKey`; route only
+// legacy root imports through a sibling shim that preserves the old name.
+const LEGACY_PI_TUI_SHIM_PATH = IS_COMPILED_BINARY
+	? bundledModuleVirtualSpecifier(`${CANONICAL_PI_SCOPE}/pi-tui`)
+	: sourceShimPath("legacy-pi-tui-shim.ts");
+
+// Package-root overrides. Shim entries (`pi-ai`, `pi-coding-agent`, `pi-tui`)
+// always replace the canonical surface so legacy helpers stay reachable. The
+// other bundled host packages (`pi-agent-core`, `pi-natives`, `pi-utils`) are
+// added only in compiled-binary mode to route extensions onto the in-process
+// module instance — in dev / source-link / installed-package mode the canonical
+// specifier resolves cleanly through `Bun.resolveSync` and hardcoding a
+// source-tree path would miss installs where bundled packages live at
+// `node_modules/@oh-my-pi/pi-*`.
 //
 // Compiled-binary entries are `omp-legacy-pi-bundled:<key>` specifiers handed
 // to the synthetic onLoad in `installLegacyPiSpecifierShim()` — bunfs paths
@@ -390,6 +508,7 @@ export function __buildLegacyPiPackageRootOverrides(
 	const candidates: Record<string, string> = {
 		[`${CANONICAL_PI_SCOPE}/pi-ai`]: LEGACY_PI_AI_SHIM_PATH,
 		[`${CANONICAL_PI_SCOPE}/pi-coding-agent`]: LEGACY_PI_CODING_AGENT_SHIM_PATH,
+		[`${CANONICAL_PI_SCOPE}/pi-tui`]: LEGACY_PI_TUI_SHIM_PATH,
 	};
 	if (isCompiled) {
 		for (const key of bundledModuleKeys) {
@@ -473,33 +592,6 @@ function toImportSpecifier(resolvedPath: string): string {
 	return url.pathToFileURL(stripWindowsExtendedLengthPathPrefix(resolvedPath)).href;
 }
 
-function rewriteLegacyPiImports(source: string): string {
-	return source.replace(
-		LEGACY_PI_IMPORT_SPECIFIER_REGEX,
-		(match, prefix: string, specifier: string, suffix: string) => {
-			const remappedSpecifier = remapLegacyPiSpecifier(specifier);
-			if (!remappedSpecifier) {
-				return match;
-			}
-
-			try {
-				return `${prefix}${toImportSpecifier(resolveCanonicalPiSpecifier(remappedSpecifier))}${suffix}`;
-			} catch {
-				// Resolution failed — typically in compiled binary mode where
-				// Bun.resolveSync cannot walk up from /$bunfs/root to find the
-				// bundled node_modules. Leave the specifier unchanged so Bun
-				// resolves it natively against the extension's own peer deps.
-				return match;
-			}
-		},
-	);
-}
-
-// Match the bare TypeBox import specifiers (static + dynamic). Subpath imports
-// like `@sinclair/typebox/compiler` are intentionally excluded — they expose
-// TypeBox-only APIs the Zod-backed shim does not provide.
-const TYPEBOX_IMPORT_SPECIFIER_REGEX = /((?:from\s+|import\s+|import\s*\(\s*)["'])(@sinclair\/typebox|typebox)(["'])/g;
-
 /**
  * Rewrite the extension-owned specifiers OMP must host-resolve — legacy
  * `@(scope)/pi-*`, bare TypeBox packages, package `imports` aliases like
@@ -508,43 +600,61 @@ const TYPEBOX_IMPORT_SPECIFIER_REGEX = /((?:from\s+|import\s+|import\s*\(\s*)["'
  * are left untouched so Bun resolves them from the extension's real on-disk
  * location.
  *
- * When `mtimeTag` is provided, extension-owned graph specifiers (relative
- * `./`/`../`, package `#alias/*`, and extension-local bare deps) also carry a
- * `?mtime=<tag>` cache-bust so Bun rekeys them on same-process reloads. Host
- * package rewrites (legacy `@(scope)/pi-*`, TypeBox shim) always emit
- * `file://` URLs because they resolve to in-process host code that never
- * changes between reloads.
+ * When `mtimeTag` is provided, extension-owned relative graph specifiers
+ * (`./`/`../`) and, by default, resolved package `#alias/*` and extension-local
+ * bare deps also carry a `?mtime=<tag>` cache-bust so Bun rekeys them on
+ * same-process reloads. `resolvedImportMtimeTag` can disable the tag for
+ * resolved package and bare imports inside third-party dependencies, whose
+ * transitive bare imports must retain a query-free importer path for Bun's
+ * runtime `node_modules` resolution. Host package rewrites (legacy
+ * `@(scope)/pi-*`, TypeBox shim) always emit `file://` URLs because they resolve
+ * to in-process host code that never changes between reloads.
  */
 async function rewriteLegacyExtensionSource(
 	source: string,
 	importerPath: string,
 	mtimeTag: string | null = null,
+	resolvedImportMtimeTag: string | null = mtimeTag,
 ): Promise<string> {
 	// Compiled mode completes the override map from the build-supplied module
 	// keys on first use; every rewrite path must see the full map.
 	await ensureLegacyPiOverridesReady();
-	const withPi = rewriteLegacyPiImports(source);
-	// When the TypeBox shim is missing (release build dropped the entrypoint —
-	// issue #3414), leave bare specifiers untouched so Bun resolves a real
-	// `typebox` / `@sinclair/typebox` install from the extension's own
-	// `node_modules`. `resolveTypeBoxSpecifier` mirrors the fall-through.
-	const withTypeBox = TYPEBOX_SHIM_PATH
-		? withPi.replace(
-				TYPEBOX_IMPORT_SPECIFIER_REGEX,
-				(_match, prefix: string, _specifier: string, suffix: string) =>
-					`${prefix}${toImportSpecifier(TYPEBOX_SHIM_PATH)}${suffix}`,
-			)
-		: withPi;
-	const withPkg = await rewriteExtensionPackageImports(withTypeBox, importerPath, mtimeTag);
-	const withBare = await rewriteExtensionBareImports(withPkg, importerPath, mtimeTag);
-	const withNativeAddons = await rewriteExtensionNativeAddonRequires(withBare, importerPath);
-	if (!mtimeTag) {
-		return withNativeAddons;
+	const references = await collectExtensionSpecifierReferences(source, importerPath);
+	const replacements: Array<ExtensionSpecifierReference & { replacement: string }> = [];
+	for (const reference of references) {
+		if (reference.kind !== "import") continue;
+
+		const specifier = reference.specifier;
+		let replacement: string | null = null;
+		const remappedSpecifier = remapLegacyPiSpecifier(specifier);
+		if (remappedSpecifier) {
+			try {
+				replacement = toImportSpecifier(resolveCanonicalPiSpecifier(remappedSpecifier));
+			} catch {
+				// Compiled fallback may be absent from a malformed build. Continue to
+				// the extension's on-disk peer dependency resolution below.
+			}
+		}
+		if (!replacement && TYPEBOX_SHIM_PATH && (specifier === "typebox" || specifier === "@sinclair/typebox")) {
+			replacement = toImportSpecifier(TYPEBOX_SHIM_PATH);
+		}
+		if (!replacement && specifier.startsWith("#")) {
+			const resolved = await resolvePackageImportSpecifier(specifier, importerPath);
+			if (resolved) replacement = toGraphImportSpecifier(resolved, resolvedImportMtimeTag);
+		}
+		if (!replacement && isBareExtensionDependencySpecifier(specifier)) {
+			const resolved = await resolveExtensionBareDependency(specifier, importerPath);
+			if (resolved) replacement = toGraphImportSpecifier(resolved, resolvedImportMtimeTag);
+		}
+		if (!replacement && mtimeTag && /^\.\.?\//.test(specifier) && !specifier.includes("?")) {
+			replacement = `${specifier}?mtime=${mtimeTag}`;
+		}
+		if (replacement && replacement !== specifier) {
+			replacements.push({ ...reference, replacement });
+		}
 	}
-	return withNativeAddons.replace(
-		RELATIVE_GRAPH_IMPORT_SPECIFIER_REGEX,
-		(_match, prefix: string, specifier: string, suffix: string) => `${prefix}${specifier}?mtime=${mtimeTag}${suffix}`,
-	);
+	const withImports = applySpecifierReplacements(source, replacements);
+	return rewriteExtensionBareRequires(withImports, importerPath);
 }
 
 /** Test seam for compiled-binary legacy extension source rewriting. */
@@ -552,14 +662,10 @@ export async function __rewriteLegacyExtensionSourceForTests(
 	source: string,
 	importerPath: string,
 	mtimeTag: string | null = null,
+	resolvedImportMtimeTag: string | null = mtimeTag,
 ): Promise<string> {
-	return rewriteLegacyExtensionSource(source, importerPath, mtimeTag);
+	return rewriteLegacyExtensionSource(source, importerPath, mtimeTag, resolvedImportMtimeTag);
 }
-
-// Match relative graph specifiers so their `./foo.ts` /`../foo` targets get a
-// `?mtime=<tag>` cache-bust suffix without disturbing already-rewritten
-// `file://` URLs or bare/host specifiers.
-const RELATIVE_GRAPH_IMPORT_SPECIFIER_REGEX = /((?:from\s+|import\s+|import\s*\(\s*)["'])(\.\.?\/[^"'?\s]*)(["'])/g;
 
 /**
  * Build the import specifier for a graph-resolved absolute path. POSIX
@@ -672,7 +778,10 @@ async function readPackageImports(packageRoot: string): Promise<Record<string, u
 type PackageImportTargetSelection = string | typeof PACKAGE_IMPORT_EXCLUDED | null;
 type ResolvedPackageImportTargetSelection = string | typeof PACKAGE_IMPORT_EXCLUDED;
 
-function selectPackageImportTarget(entry: unknown): PackageImportTargetSelection {
+function selectPackageImportTarget(
+	entry: unknown,
+	conditions: ReadonlySet<string> = SUPPORTED_PACKAGE_IMPORT_CONDITIONS,
+): PackageImportTargetSelection {
 	if (entry === null) {
 		return PACKAGE_IMPORT_EXCLUDED;
 	}
@@ -681,7 +790,7 @@ function selectPackageImportTarget(entry: unknown): PackageImportTargetSelection
 	}
 	if (Array.isArray(entry)) {
 		for (const item of entry) {
-			const target = selectPackageImportTarget(item);
+			const target = selectPackageImportTarget(item, conditions);
 			if (target !== null) return target;
 		}
 		return null;
@@ -690,10 +799,10 @@ function selectPackageImportTarget(entry: unknown): PackageImportTargetSelection
 		return null;
 	}
 	for (const [condition, value] of Object.entries(entry)) {
-		if (!SUPPORTED_PACKAGE_IMPORT_CONDITIONS.has(condition)) {
+		if (!conditions.has(condition)) {
 			continue;
 		}
-		const target = selectPackageImportTarget(value);
+		const target = selectPackageImportTarget(value, conditions);
 		if (target !== null) return target;
 	}
 	return null;
@@ -764,38 +873,6 @@ async function resolvePackageImportSpecifier(specifier: string, importerPath: st
 	}
 	return resolvePackageImportTarget(packageRoot, bestMatch.target, bestMatch.wildcard);
 }
-
-const PACKAGE_IMPORT_SPECIFIER_REGEX = /((?:from\s+|import\s+|import\s*\(\s*)["'])(#[^"'()\s]+)(["'])/g;
-
-async function rewriteExtensionPackageImports(
-	source: string,
-	importerPath: string,
-	mtimeTag: string | null = null,
-): Promise<string> {
-	let rewritten = "";
-	let lastIndex = 0;
-	for (const match of source.matchAll(PACKAGE_IMPORT_SPECIFIER_REGEX)) {
-		const matchIndex = match.index;
-		if (matchIndex === undefined) continue;
-
-		const [fullMatch, prefix, specifier, suffix] = match;
-		if (!prefix || !specifier || !suffix) continue;
-
-		const resolved = await resolvePackageImportSpecifier(specifier, importerPath);
-		if (!resolved) continue;
-
-		rewritten += source.slice(lastIndex, matchIndex);
-		rewritten += `${prefix}${toGraphImportSpecifier(resolved, mtimeTag)}${suffix}`;
-		lastIndex = matchIndex + fullMatch.length;
-	}
-
-	if (lastIndex === 0) {
-		return source;
-	}
-	return `${rewritten}${source.slice(lastIndex)}`;
-}
-
-const BARE_EXTENSION_IMPORT_SPECIFIER_REGEX = /((?:from\s+|import\s+|import\s*\(\s*)["'])([^"'()\s]+)(["'])/g;
 
 function isBareExtensionDependencySpecifier(specifier: string): boolean {
 	if (
@@ -888,9 +965,10 @@ async function resolveNodePackageExport(
 	packageRoot: string,
 	subpath: string | null,
 	manifest: Record<string, unknown>,
+	conditions: ReadonlySet<string> = SUPPORTED_PACKAGE_IMPORT_CONDITIONS,
 ): Promise<string | null> {
 	const exportsField = manifest.exports;
-	const rootTarget = subpath === null ? selectPackageImportTarget(exportsField) : null;
+	const rootTarget = subpath === null ? selectPackageImportTarget(exportsField, conditions) : null;
 	if (rootTarget !== null && rootTarget !== PACKAGE_IMPORT_EXCLUDED) {
 		return resolvePackageExportTarget(packageRoot, rootTarget, null);
 	}
@@ -899,30 +977,41 @@ async function resolveNodePackageExport(
 	}
 
 	const exactKey = subpath === null ? "." : `./${subpath}`;
-	const exactTarget = selectPackageImportTarget(exportsField[exactKey]);
-	if (exactTarget !== null && exactTarget !== PACKAGE_IMPORT_EXCLUDED) {
-		return resolvePackageExportTarget(packageRoot, exactTarget, null);
+	if (Object.hasOwn(exportsField, exactKey)) {
+		const exactTarget = selectPackageImportTarget(exportsField[exactKey], conditions);
+		return exactTarget !== null && exactTarget !== PACKAGE_IMPORT_EXCLUDED
+			? resolvePackageExportTarget(packageRoot, exactTarget, null)
+			: null;
 	}
 
+	let bestMatch: {
+		keyLength: number;
+		prefixLength: number;
+		target: PackageImportTargetSelection;
+		wildcard: string;
+	} | null = null;
 	for (const [key, entry] of Object.entries(exportsField)) {
 		const starIndex = key.indexOf("*");
-		if (starIndex === -1 || subpath === null) continue;
+		if (starIndex === -1 || subpath === null || !key.startsWith("./")) continue;
 		const prefix = key.slice(2, starIndex);
 		const suffix = key.slice(starIndex + 1);
-		if (!subpath.startsWith(prefix) || !subpath.endsWith(suffix)) {
-			continue;
+		if (!subpath.startsWith(prefix) || !subpath.endsWith(suffix)) continue;
+		if (
+			!bestMatch ||
+			prefix.length > bestMatch.prefixLength ||
+			(prefix.length === bestMatch.prefixLength && key.length > bestMatch.keyLength)
+		) {
+			bestMatch = {
+				keyLength: key.length,
+				prefixLength: prefix.length,
+				target: selectPackageImportTarget(entry, conditions),
+				wildcard: subpath.slice(prefix.length, subpath.length - suffix.length),
+			};
 		}
-		const target = selectPackageImportTarget(entry);
-		if (target === null || target === PACKAGE_IMPORT_EXCLUDED) {
-			continue;
-		}
-		return resolvePackageExportTarget(
-			packageRoot,
-			target,
-			subpath.slice(prefix.length, subpath.length - suffix.length),
-		);
 	}
-	return null;
+	return bestMatch?.target && bestMatch.target !== PACKAGE_IMPORT_EXCLUDED
+		? resolvePackageExportTarget(packageRoot, bestMatch.target, bestMatch.wildcard)
+		: null;
 }
 
 async function resolveNodePackageFallback(
@@ -950,10 +1039,29 @@ async function resolveNodePackageDependency(specifier: string, importerPath: str
 	if (!packageRoot) return null;
 	const manifest = await readPackageManifest(packageRoot);
 	if (!manifest) return null;
-	return (
-		(await resolveNodePackageExport(packageRoot, parsed.subpath, manifest)) ??
-		(await resolveNodePackageFallback(packageRoot, parsed.subpath, manifest))
-	);
+	return Object.hasOwn(manifest, "exports")
+		? resolveNodePackageExport(packageRoot, parsed.subpath, manifest)
+		: resolveNodePackageFallback(packageRoot, parsed.subpath, manifest);
+}
+
+async function resolveNodePackageRequire(specifier: string, importerPath: string): Promise<string | null> {
+	const parsed = splitBarePackageSpecifier(specifier);
+	if (!parsed) return null;
+	const packageRoot = await findNodePackageRoot(parsed.name, importerPath);
+	if (!packageRoot) return null;
+	const manifest = await readPackageManifest(packageRoot);
+	if (!manifest) return null;
+
+	if (Object.hasOwn(manifest, "exports")) {
+		return resolveNodePackageExport(packageRoot, parsed.subpath, manifest, SUPPORTED_PACKAGE_REQUIRE_CONDITIONS);
+	}
+	if (parsed.subpath !== null) {
+		return resolveSourceModuleFile(path.join(packageRoot, parsed.subpath));
+	}
+	const main = manifest.main;
+	return typeof main === "string"
+		? await resolveSourceModuleFile(path.resolve(packageRoot, main))
+		: await resolveSourceModuleFile(path.join(packageRoot, "index"));
 }
 
 async function resolveExtensionBareDependency(specifier: string, importerPath: string): Promise<string | null> {
@@ -971,6 +1079,13 @@ async function resolveExtensionBareDependency(specifier: string, importerPath: s
 }
 
 async function resolveExtensionBareDependencyUncached(specifier: string, importerPath: string): Promise<string | null> {
+	// Resolve against the runtime package manifest first. Besides working in a
+	// compiled binary, this preserves the package's ESM `import` condition when
+	// the absolute target is later loaded outside normal package resolution.
+	const packageResolved = await resolveNodePackageDependency(specifier, importerPath);
+	if (packageResolved) {
+		return packageResolved;
+	}
 	try {
 		const resolved = Bun.resolveSync(specifier, path.dirname(importerPath));
 		if (resolved && resolved !== specifier && !resolved.startsWith("node:") && !resolved.startsWith("bun:")) {
@@ -979,15 +1094,10 @@ async function resolveExtensionBareDependencyUncached(specifier: string, importe
 	} catch {
 		// Compiled binaries do not reliably resolve runtime extension node_modules.
 	}
-	return resolveNodePackageDependency(specifier, importerPath);
+	return null;
 }
 
 const NATIVE_ADDON_EXTENSION = ".node";
-
-// Match CommonJS require calls so bare native-addon specifiers can be pinned
-// to absolute paths. Only requires whose resolution lands on a `.node` addon
-// are rewritten; everything else stays on Bun's native resolver.
-const NATIVE_ADDON_REQUIRE_SPECIFIER_REGEX = /(\brequire\s*\(\s*["'])([^"'()\s]+)(["']\s*\))/g;
 
 /**
  * Resolve a bare specifier whose target is a native `.node` addon — either a
@@ -1031,42 +1141,63 @@ async function resolveExtensionNativeAddonUncached(specifier: string, importerPa
 	return realpathOrSelf(target);
 }
 
+async function resolveExtensionBareRequire(specifier: string, importerPath: string): Promise<string | null> {
+	if (!isBareExtensionDependencySpecifier(specifier)) {
+		return null;
+	}
+
+	const cacheKey = `${specifier}\0${path.resolve(path.dirname(importerPath))}`;
+	const cached = bareRequireResolutionCache.get(cacheKey);
+	if (cached) return cached;
+
+	const resolution = (async () => {
+		const nativeAddon = await resolveExtensionNativeAddon(specifier, importerPath);
+		if (nativeAddon) {
+			return nativeAddon;
+		}
+		const packageResolved = await resolveNodePackageRequire(specifier, importerPath);
+		if (packageResolved) {
+			return realpathOrSelf(packageResolved);
+		}
+		try {
+			const resolved = createRequire(importerPath).resolve(specifier);
+			return resolved === specifier || resolved.startsWith("node:") || resolved.startsWith("bun:")
+				? null
+				: await realpathOrSelf(resolved);
+		} catch {
+			return null;
+		}
+	})();
+	bareRequireResolutionCache.set(cacheKey, resolution);
+	return resolution;
+}
+
 /**
- * Rewrite bare `require()` specifiers that resolve to native `.node` addons
- * into absolute-path requires. In `bun build --compile` binaries, Bun's bare
- * resolution fails for packages whose `main` is a `.node` addon ("Cannot find
- * module '@scope/pkg-<platform>'") even when the package sits in the
- * extension's own node_modules; requiring the addon by absolute path works.
+ * Rewrite bare `require()` specifiers into absolute-path requires. In
+ * `bun build --compile` binaries, runtime resolution fails even when the
+ * package sits in the extension's own node_modules. Manifest resolution
+ * preserves CommonJS `require` export conditions and native-addon entrypoints;
+ * relative and builtin requires remain untouched.
  */
-async function rewriteExtensionNativeAddonRequires(source: string, importerPath: string): Promise<string> {
-	let rewritten = "";
-	let lastIndex = 0;
-	for (const match of source.matchAll(NATIVE_ADDON_REQUIRE_SPECIFIER_REGEX)) {
-		const matchIndex = match.index;
-		if (matchIndex === undefined) continue;
-
-		const [fullMatch, prefix, specifier, suffix] = match;
-		if (!prefix || !specifier || !suffix) continue;
-
-		const resolved = await resolveExtensionNativeAddon(specifier, importerPath);
+async function rewriteExtensionBareRequires(source: string, importerPath: string): Promise<string> {
+	const references = await collectExtensionSpecifierReferences(source, importerPath);
+	const replacements: Array<ExtensionSpecifierReference & { replacement: string }> = [];
+	for (const reference of references) {
+		if (reference.kind !== "require") continue;
+		const resolved = await resolveExtensionBareRequire(reference.specifier, importerPath);
 		if (!resolved) continue;
-
-		rewritten += source.slice(lastIndex, matchIndex);
-		// Forward slashes keep Windows paths valid inside single- or double-quoted literals.
-		rewritten += `${prefix}${stripWindowsExtendedLengthPathPrefix(resolved).replaceAll("\\", "/")}${suffix}`;
-		lastIndex = matchIndex + fullMatch.length;
+		replacements.push({
+			...reference,
+			replacement: stripWindowsExtendedLengthPathPrefix(resolved).replaceAll("\\", "/"),
+		});
 	}
-
-	if (lastIndex === 0) {
-		return source;
-	}
-	return `${rewritten}${source.slice(lastIndex)}`;
+	return applySpecifierReplacements(source, replacements);
 }
 
 /**
  * Whether a module's source contains a bare require that resolves to a native
  * `.node` addon — i.e. a napi-rs style loader that must be hooked into the
- * extension graph so {@link rewriteExtensionNativeAddonRequires} can pin its
+ * extension graph so {@link rewriteExtensionBareRequires} can pin its
  * platform-package requires to absolute paths.
  */
 async function moduleRequiresNativeAddon(modulePath: string): Promise<boolean> {
@@ -1085,61 +1216,29 @@ async function moduleRequiresNativeAddonUncached(modulePath: string): Promise<bo
 	} catch {
 		return false;
 	}
-	for (const match of source.matchAll(NATIVE_ADDON_REQUIRE_SPECIFIER_REGEX)) {
-		const specifier = match[2];
-		if (specifier && (await resolveExtensionNativeAddon(specifier, modulePath))) {
+	for (const reference of await collectExtensionSpecifierReferences(source, modulePath)) {
+		if (reference.kind === "require" && (await resolveExtensionNativeAddon(reference.specifier, modulePath))) {
 			return true;
 		}
 	}
 	return false;
 }
 
-async function rewriteExtensionBareImports(
-	source: string,
-	importerPath: string,
-	mtimeTag: string | null = null,
-): Promise<string> {
-	let rewritten = "";
-	let lastIndex = 0;
-	for (const match of source.matchAll(BARE_EXTENSION_IMPORT_SPECIFIER_REGEX)) {
-		const matchIndex = match.index;
-		if (matchIndex === undefined) continue;
-
-		const [fullMatch, prefix, specifier, suffix] = match;
-		if (!prefix || !specifier || !suffix) continue;
-
-		const resolved = await resolveExtensionBareDependency(specifier, importerPath);
-		if (!resolved) continue;
-
-		rewritten += source.slice(lastIndex, matchIndex);
-		rewritten += `${prefix}${toGraphImportSpecifier(resolved, mtimeTag)}${suffix}`;
-		lastIndex = matchIndex + fullMatch.length;
-	}
-
-	if (lastIndex === 0) {
-		return source;
-	}
-	return `${rewritten}${source.slice(lastIndex)}`;
-}
-
 function escapeRegExp(value: string): string {
 	return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
-// Match source modules in an extension graph: relative imports, package
-// `imports` aliases such as `#src/*`, and extension-local bare dependency
-// entries. Bare imports inside node_modules dependencies remain native Bun
-// resolutions; once the dependency entry is hooked, its relative children are
-// still collected and rewritten with the reload mtime tag. `require()` calls
-// are scanned too so CJS entries and napi-rs loaders reached without an
-// import statement still join the graph.
-const EXTENSION_GRAPH_SPECIFIER_REGEX = /((?:from\s+|import\s+|import\s*\(\s*)["'])([^"'()\s]+)(["'])/g;
+// Source modules in an extension graph are discovered from parsed static,
+// dynamic, re-export, and direct CommonJS require specifiers. Parsing keeps
+// import-looking text in strings, templates, regex literals, and comments out
+// of dependency resolution.
 
 // Extension source realpaths already covered by an installed load-time hook for
 // each entry. `Bun.plugin()` registrations are process-global and permanent, so
 // reloads install supplemental hooks only for modules added to the graph since
 // the previous load.
 const extensionGraphHookModules = new Map<string, Set<string>>();
+const extensionGraphCacheBustResolvedImportModules = new Map<string, Set<string>>();
 const commonJsModuleSources = new Map<string, string>();
 const commonJsFallbackModulePaths = new Map<string, string>();
 const COMMONJS_REQUIRE_GLOBAL = "__ompLegacyPiRequireGraphModule";
@@ -1234,22 +1333,27 @@ async function realpathOrSelfUncached(p: string): Promise<string> {
 	}
 }
 
+interface ExtensionModuleGraph {
+	readonly modules: Map<string, string>;
+	readonly cacheBustResolvedImportModules: Set<string>;
+}
+
 /**
  * Walk the extension's import graph starting at `entryRealPath`, returning the
  * realpath of every reachable source module OMP must rewrite at load time.
- * Relative imports and package `imports` aliases are always graph-owned.
- * Extension-local bare dependency entries are also included so their relative
- * children receive the reload mtime tag; bare imports inside those dependencies
- * remain native Bun resolutions to avoid taking over full third-party graphs.
+ * Relative imports, package `imports` aliases, and ESM bare dependencies are
+ * graph-owned recursively because compiled Bun cannot resolve runtime
+ * `node_modules` from those modules. Resolved imports inside third-party
+ * dependencies omit the reload tag so their importer paths stay query-free.
  * CommonJS modules reached through `require()` stay on Bun's native loader
  * unless they resolve native addons. CommonJS reached through ESM imports stays
  * graph-owned so the load hook can expose its exports through an ESM default.
  */
-async function collectExtensionModules(entryRealPath: string): Promise<Map<string, string>> {
+async function collectExtensionModules(entryRealPath: string): Promise<ExtensionModuleGraph> {
 	const modules = new Map<string, string>();
-	const queuedFollowBareDependencies = new Map<string, boolean>([[entryRealPath, true]]);
-	const queue: Array<{ file: string; followBareDependencies: boolean }> = [
-		{ file: entryRealPath, followBareDependencies: true },
+	const queuedCacheBustResolvedImports = new Map<string, boolean>([[entryRealPath, true]]);
+	const queue: Array<{ file: string; cacheBustResolvedImports: boolean }> = [
+		{ file: entryRealPath, cacheBustResolvedImports: true },
 	];
 	while (queue.length > 0) {
 		const item = queue.pop();
@@ -1257,7 +1361,7 @@ async function collectExtensionModules(entryRealPath: string): Promise<Map<strin
 			continue;
 		}
 		const file = item.file;
-		const followBareDependencies = queuedFollowBareDependencies.get(file) ?? item.followBareDependencies;
+		const cacheBustResolvedImports = queuedCacheBustResolvedImports.get(file) ?? item.cacheBustResolvedImports;
 		if (modules.has(file)) {
 			continue;
 		}
@@ -1269,22 +1373,13 @@ async function collectExtensionModules(entryRealPath: string): Promise<Map<strin
 		}
 		modules.set(file, source);
 		const dir = path.dirname(file);
-		const specifiers = new Set<string>();
-		const requiredSpecifiers = new Set<string>();
-		for (const match of source.matchAll(EXTENSION_GRAPH_SPECIFIER_REGEX)) {
-			if (match[2]) specifiers.add(match[2]);
-		}
-		for (const match of source.matchAll(NATIVE_ADDON_REQUIRE_SPECIFIER_REGEX)) {
-			if (match[2]) {
-				specifiers.add(match[2]);
-				requiredSpecifiers.add(match[2]);
-			}
-		}
-		for (const specifier of specifiers) {
+		const references = await collectExtensionSpecifierReferences(source, file);
+		for (const reference of references) {
+			const specifier = reference.specifier;
 			try {
 				let resolved: string | null = null;
-				let nextFollowsBareDependencies = followBareDependencies;
-				const isRequired = requiredSpecifiers.has(specifier);
+				let nextCacheBustResolvedImports = cacheBustResolvedImports;
+				const isRequired = reference.kind === "require";
 				if (specifier.startsWith(".")) {
 					const candidate = Bun.resolveSync(specifier, dir);
 					if (
@@ -1299,7 +1394,6 @@ async function collectExtensionModules(entryRealPath: string): Promise<Map<strin
 						resolved = candidate;
 					}
 				} else if (
-					followBareDependencies &&
 					isBareExtensionDependencySpecifier(specifier) &&
 					!remapLegacyPiSpecifier(specifier) &&
 					specifier !== "typebox" &&
@@ -1309,11 +1403,27 @@ async function collectExtensionModules(entryRealPath: string): Promise<Map<strin
 					const packageRoot = parsed ? await findNodePackageRoot(parsed.name, file) : null;
 					const manifest = packageRoot ? await readPackageManifest(packageRoot) : null;
 					const dependencyEntry = manifest ? await resolveExtensionBareDependency(specifier, file) : null;
+					const declaredModuleEntry =
+						packageRoot && parsed?.subpath === null && typeof manifest?.module === "string"
+							? await resolveSourceModuleFile(path.resolve(packageRoot, manifest.module))
+							: null;
 					const dependencyExtension = dependencyEntry ? path.extname(dependencyEntry) : null;
+					const modulePackageRoot =
+						dependencyEntry && (dependencyExtension === ".js" || dependencyExtension === ".jsx")
+							? await findPackageRoot(dependencyEntry)
+							: null;
+					const moduleManifest = modulePackageRoot ? await readPackageManifest(modulePackageRoot) : null;
+					const selectedDeclaredModule = Boolean(
+						dependencyEntry &&
+							declaredModuleEntry &&
+							path.resolve(dependencyEntry) === path.resolve(declaredModuleEntry),
+					);
 					const isCommonJsEntry =
 						dependencyExtension === ".cjs" ||
 						dependencyExtension === ".cts" ||
-						((dependencyExtension === ".js" || dependencyExtension === ".jsx") && manifest?.type !== "module");
+						((dependencyExtension === ".js" || dependencyExtension === ".jsx") &&
+							moduleManifest?.type !== "module" &&
+							!selectedDeclaredModule);
 					const isHookableEntry = Boolean(dependencyEntry && hasSourceModuleExtension(dependencyEntry));
 					const hookCommonJsEntry =
 						isHookableEntry && isCommonJsEntry && dependencyEntry
@@ -1325,16 +1435,18 @@ async function collectExtensionModules(entryRealPath: string): Promise<Map<strin
 					if (resolved && hookCommonJsEntry) {
 						nativeAddonLoaderModulePaths.add(resolved);
 					}
-					nextFollowsBareDependencies = false;
+					nextCacheBustResolvedImports = false;
 				}
 				if (resolved && isRequired) {
 					nativeAddonLoaderModulePaths.add(resolved);
 				}
-				if (resolved && !modules.has(resolved)) {
-					const queuedFollowsBareDependencies = queuedFollowBareDependencies.get(resolved) ?? false;
-					const mergedFollowsBareDependencies = queuedFollowsBareDependencies || nextFollowsBareDependencies;
-					queuedFollowBareDependencies.set(resolved, mergedFollowsBareDependencies);
-					queue.push({ file: resolved, followBareDependencies: mergedFollowsBareDependencies });
+				if (resolved) {
+					const queuedCacheBust = queuedCacheBustResolvedImports.get(resolved) ?? false;
+					const mergedCacheBust = queuedCacheBust || nextCacheBustResolvedImports;
+					queuedCacheBustResolvedImports.set(resolved, mergedCacheBust);
+					if (!modules.has(resolved)) {
+						queue.push({ file: resolved, cacheBustResolvedImports: mergedCacheBust });
+					}
 				}
 			} catch {
 				// Unresolvable import (e.g. a type-only path); skip it.
@@ -1344,10 +1456,17 @@ async function collectExtensionModules(entryRealPath: string): Promise<Map<strin
 	for (const modulePath of nativeAddonLoaderModulePaths) {
 		const source = modules.get(modulePath);
 		if (source !== undefined) {
-			modules.set(modulePath, await rewriteExtensionNativeAddonRequires(source, modulePath));
+			modules.set(modulePath, await rewriteExtensionBareRequires(source, modulePath));
 		}
 	}
-	return modules;
+	return {
+		modules,
+		cacheBustResolvedImportModules: new Set(
+			[...queuedCacheBustResolvedImports]
+				.filter(([modulePath, enabled]) => enabled && modules.has(modulePath))
+				.map(([modulePath]) => modulePath),
+		),
+	};
 }
 
 /**
@@ -1436,6 +1555,7 @@ async function installExtensionGraphHook(
 	entryRealPath: string,
 	modules: Map<string, string>,
 	commonJsPaths: Set<string>,
+	cacheBustResolvedImportModules: ReadonlySet<string>,
 ): Promise<{ asyncModules: Map<string, string>; syncSourceModules: Map<string, string> }> {
 	const asyncModules = new Map<string, string>();
 	const syncSourceModules = new Map<string, string>();
@@ -1472,8 +1592,9 @@ async function installExtensionGraphHook(
 					} else {
 						raw = await Bun.file(sourcePath).text();
 					}
+					const resolvedImportMtimeTag = cacheBustResolvedImportModules.has(sourcePath) ? mtimeTag : null;
 					return {
-						contents: await rewriteLegacyExtensionSource(raw, sourcePath, mtimeTag),
+						contents: await rewriteLegacyExtensionSource(raw, sourcePath, mtimeTag, resolvedImportMtimeTag),
 						loader: getLoader(sourcePath),
 					};
 				});
@@ -1537,7 +1658,16 @@ async function installExtensionGraphHook(
  * during the initial load; `undefined` when no new modules were discovered.
  */
 async function ensureExtensionGraphHook(entryRealPath: string): Promise<{ clear(): void } | undefined> {
-	const currentModules = await collectExtensionModules(entryRealPath);
+	const { modules: currentModules, cacheBustResolvedImportModules: discoveredCacheBustModules } =
+		await collectExtensionModules(entryRealPath);
+	let cacheBustResolvedImportModules = extensionGraphCacheBustResolvedImportModules.get(entryRealPath);
+	if (!cacheBustResolvedImportModules) {
+		cacheBustResolvedImportModules = new Set<string>();
+		extensionGraphCacheBustResolvedImportModules.set(entryRealPath, cacheBustResolvedImportModules);
+	}
+	for (const modulePath of discoveredCacheBustModules) {
+		cacheBustResolvedImportModules.add(modulePath);
+	}
 	const commonJsPaths = new Set<string>();
 	for (const [modulePath, source] of currentModules) {
 		const extension = path.extname(modulePath);
@@ -1573,6 +1703,7 @@ async function ensureExtensionGraphHook(entryRealPath: string): Promise<{ clear(
 			entryRealPath,
 			pendingModules,
 			pendingCommonJsPaths,
+			cacheBustResolvedImportModules,
 		));
 		for (const modulePath of pendingModules.keys()) {
 			hookedModules.add(modulePath);

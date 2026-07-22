@@ -330,6 +330,34 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 		expect(second.depValue).toBe("dep-v2");
 	});
 
+	it("keeps transitive bare dependency importer paths query-free", async () => {
+		const dir = await writePackage({
+			"package.json": JSON.stringify({ name: "transitive-bare-dep-ext", version: "1.0.0", type: "module" }),
+			"node_modules/directdep/package.json": JSON.stringify({
+				name: "directdep",
+				version: "1.0.0",
+				type: "module",
+				exports: "./index.js",
+			}),
+			"node_modules/directdep/index.js": 'export { nestedUrl } from "nesteddep";\n',
+			"node_modules/nesteddep/package.json": JSON.stringify({
+				name: "nesteddep",
+				version: "1.0.0",
+				type: "module",
+				exports: "./index.js",
+			}),
+			"node_modules/nesteddep/index.js": "export const nestedUrl = import.meta.url;\n",
+			"index.ts": 'export { nestedUrl } from "directdep";\nexport default function (pi) { void pi; }\n',
+		});
+
+		const mod = (await loadLegacyPiModule(path.join(dir, "index.ts"))) as { nestedUrl: string };
+		const expectedNestedUrl = url.pathToFileURL(
+			await fs.realpath(path.join(dir, "node_modules/nesteddep/index.js")),
+		).href;
+
+		expect(mod.nestedUrl).toBe(expectedNestedUrl);
+	});
+
 	it("reloads modules added to the relative import graph after the first load", async () => {
 		const entrySource = (version: string, includeHelper: boolean): string =>
 			[
@@ -607,7 +635,7 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 			[
 				'import * as path from "node:path";',
 				'import { value } from "esmdep/value";',
-				'import { rootValue } from "rootdep";',
+				'import{rootValue}from"rootdep";',
 				"export const loaded = value + rootValue;",
 			].join("\n"),
 			importer,
@@ -626,9 +654,52 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 		expect(rewritten).toContain('from "node:path"');
 	});
 
-	it("pins native-addon package requires to absolute extension paths", async () => {
+	it("honors export pattern specificity and package encapsulation", async () => {
 		const dir = await writePackage({
-			"package.json": JSON.stringify({ name: "native-require-ext", version: "1.0.0" }),
+			"package.json": JSON.stringify({ name: "exports-contract-ext", version: "1.0.0", type: "module" }),
+			"node_modules/pattern-dep/package.json": JSON.stringify({
+				name: "pattern-dep",
+				version: "1.0.0",
+				type: "module",
+				exports: { "./*": "./fallback/*.js", "./feature/*": "./features/*.js" },
+			}),
+			"node_modules/pattern-dep/fallback/feature/x.js": "export const selected = 'fallback';",
+			"node_modules/pattern-dep/features/x.js": "export const selected = 'specific';",
+			"node_modules/blocked-dep/package.json": JSON.stringify({
+				name: "blocked-dep",
+				version: "1.0.0",
+				main: "./legacy.cjs",
+				exports: { ".": { import: "./esm.js" }, "./private": null },
+			}),
+			"node_modules/blocked-dep/esm.js": "export default {};",
+			"node_modules/blocked-dep/legacy.cjs": "module.exports = {};",
+			"node_modules/blocked-dep/private.js": "export default {};",
+			"index.ts": "",
+		});
+		const importer = path.join(dir, "index.ts");
+		const rewritten = await __rewriteLegacyExtensionSourceForTests(
+			[
+				'import { selected } from "pattern-dep/feature/x";',
+				'import privateValue from "blocked-dep/private";',
+				'const privateRequire = require("blocked-dep/private");',
+				'const rootRequire = require("blocked-dep");',
+			].join("\n"),
+			importer,
+		);
+
+		const specificUrl = url.pathToFileURL(
+			await fs.realpath(path.join(dir, "node_modules/pattern-dep/features/x.js")),
+		).href;
+		expect(rewritten).toContain(specificUrl);
+		expect(rewritten).not.toContain("fallback/feature/x.js");
+		expect(rewritten).toContain('from "blocked-dep/private"');
+		expect(rewritten).toContain('require("blocked-dep/private")');
+		expect(rewritten).toContain('require("blocked-dep")');
+	});
+
+	it("pins bare package requires to absolute extension paths", async () => {
+		const dir = await writePackage({
+			"package.json": JSON.stringify({ name: "bare-require-ext", version: "1.0.0" }),
 			"node_modules/@fixture/native-platform/package.json": JSON.stringify({
 				name: "@fixture/native-platform",
 				version: "1.0.0",
@@ -641,6 +712,13 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 				main: "index.js",
 			}),
 			"node_modules/plain-dep/index.js": "module.exports = {};",
+			"node_modules/condition-dep/package.json": JSON.stringify({
+				name: "condition-dep",
+				version: "1.0.0",
+				exports: { import: "./esm.js", require: "./cjs.cjs" },
+			}),
+			"node_modules/condition-dep/esm.js": "export default {};",
+			"node_modules/condition-dep/cjs.cjs": "module.exports = {};",
 			"index.ts": "",
 		});
 		const importer = path.join(dir, "index.ts");
@@ -648,16 +726,28 @@ describe("legacy-pi in-place module loading (issue #1674)", () => {
 			[
 				'const binding = require("@fixture/native-platform");',
 				'const plain = require("plain-dep");',
+				'const conditional = require("condition-dep");',
 				'const local = require("./local.node");',
-				"export { binding, plain, local };",
+				'const member = loader.require("plain-dep");',
+				'const importText = `from"plain-dep"`;',
+				'const importPattern = /from"typebox"/;',
+				'function shadowed(require) { return require("plain-dep"); }',
+				"export { binding, conditional, importPattern, importText, local, member, plain, shadowed };",
 			].join("\n"),
 			importer,
 		);
 
 		const addon = await fs.realpath(path.join(dir, "node_modules/@fixture/native-platform/binding.node"));
+		const plainDep = await fs.realpath(path.join(dir, "node_modules/plain-dep/index.js"));
+		const conditionalDep = await fs.realpath(path.join(dir, "node_modules/condition-dep/cjs.cjs"));
 		expect(rewritten).toContain(`require("${addon.replaceAll("\\", "/")}")`);
-		expect(rewritten).toContain('require("plain-dep")');
+		expect(rewritten).toContain(`require("${plainDep.replaceAll("\\", "/")}")`);
+		expect(rewritten).toContain(`require("${conditionalDep.replaceAll("\\", "/")}")`);
 		expect(rewritten).toContain('require("./local.node")');
+		expect(rewritten).toContain('loader.require("plain-dep")');
+		expect(rewritten).toContain('`from"plain-dep"`');
+		expect(rewritten).toContain('/from"typebox"/');
+		expect(rewritten).toContain('function shadowed(require) { return require("plain-dep"); }');
 	});
 
 	it("preserves native-addon rewrites inside wrapped CommonJS dependencies", async () => {

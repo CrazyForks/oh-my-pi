@@ -511,6 +511,19 @@ esac
 			expect(elapsed).toBeLessThan(10_000);
 			expect(started.readyTimedOut).toBeFalse();
 			expect(started.daemon.readyAt).toBeDefined();
+
+			// A for:"ready" wait on the settled daemon reports success via the sticky
+			// readyAt marker even though the process has already exited.
+			const waited = await client.request({
+				op: "wait",
+				name: "fast",
+				for: "ready",
+				timeoutMs: 60_000,
+			});
+			expect(waited.op).toBe("wait");
+			if (waited.op !== "wait") throw new Error("unexpected wait result");
+			expect(waited.timedOut).toBeFalse();
+			expect(waited.daemon.readyAt).toBeDefined();
 		} finally {
 			await shutdown(client);
 		}
@@ -551,7 +564,9 @@ esac
 			expect(started.daemon.readyAt).toBeUndefined();
 			expect(["exited", "failed"]).toContain(started.daemon.state);
 
-			// A for:"ready" wait on the already-settled daemon must not hang either.
+			// A for:"ready" wait on the already-settled daemon must wake immediately,
+			// but a process that never became ready is surfaced as not ready
+			// (timedOut) so callers don't chain work against a dead process.
 			const t1 = Date.now();
 			const waited = await client.request({
 				op: "wait",
@@ -563,7 +578,8 @@ esac
 			expect(waited.op).toBe("wait");
 			if (waited.op !== "wait") throw new Error("unexpected wait result");
 			expect(waitElapsed).toBeLessThan(10_000);
-			expect(waited.timedOut).toBeFalse();
+			expect(waited.timedOut).toBeTrue();
+			expect(waited.daemon.readyAt).toBeUndefined();
 		} finally {
 			await shutdown(client);
 		}

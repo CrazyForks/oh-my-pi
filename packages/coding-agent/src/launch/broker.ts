@@ -826,6 +826,12 @@ class DaemonBroker {
 				throw new Error(`Invalid wait regex: ${error instanceof Error ? error.message : String(error)}`);
 			}
 		}
+		// Readiness was actually observed: the sticky readyAt survives a fast
+		// ready→exit, a live "ready" state, or a "running" daemon with no ready spec.
+		const readyObserved = (): boolean =>
+			record.snapshot.readyAt !== undefined ||
+			record.snapshot.state === "ready" ||
+			(record.snapshot.state === "running" && !record.spec.ready);
 		const condition = (): boolean => {
 			if (pattern) {
 				const match = pattern.exec(record.readinessBuffer);
@@ -834,14 +840,16 @@ class DaemonBroker {
 				return true;
 			}
 			if (operation.for === "exit") return terminalState(record.snapshot.state);
-			// A settled daemon that flipped ready→exited within a poll interval still
-			// satisfies for:"ready" via the sticky readyAt marker; a terminal state
-			// wakes the wait so it never blocks for the full timeout.
-			if (record.snapshot.readyAt !== undefined || terminalState(record.snapshot.state)) return true;
-			return record.snapshot.state === "ready" || (record.snapshot.state === "running" && !record.spec.ready);
+			// Wake on observed readiness or any terminal state so the wait never
+			// blocks for the full timeout; success is judged by readyObserved below.
+			return readyObserved() || terminalState(record.snapshot.state);
 		};
-		const reached = condition() || (await this.#waitUntil(record, condition, operation.timeoutMs));
-		return { op: "wait", daemon: record.snapshot, matched, timedOut: !reached };
+		const woke = condition() || (await this.#waitUntil(record, condition, operation.timeoutMs));
+		// A for:"ready" wait that woke on a terminal exit without ever observing
+		// readiness is still "not ready" — surface it as timed out so callers and the
+		// renderer don't chain work against a dead process.
+		const timedOut = operation.for === "ready" && !pattern ? !readyObserved() : !woke;
+		return { op: "wait", daemon: record.snapshot, matched, timedOut };
 	}
 
 	async #send(operation: Extract<DaemonOperation, { op: "send" }>): Promise<DaemonRpcResult> {

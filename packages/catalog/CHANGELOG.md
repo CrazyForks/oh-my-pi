@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed cached models that reuse a bundled request model — including GitHub Copilot `-1m` long-context variants — being flagged unrestorable and dropped after a restart. Header restoration now matches the `requestModelId` base and bypasses a stale `unrestorable` marker written by the old id-only cache writer. ([#6037](https://github.com/can1357/oh-my-pi/issues/6037), [#6284](https://github.com/can1357/oh-my-pi/issues/6284))
+
 ## [17.0.6] - 2026-07-20
 
 ### Added

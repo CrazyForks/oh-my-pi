@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed GitHub Copilot 1M-context models (e.g. `github-copilot/gpt-5.6-sol-1m`) disappearing from the model picker on restart, with a `Could not restore model` warning, until discovery was manually refreshed. The startup cache loader now restores their transport headers from the bundled base via `requestModelId`. ([#6037](https://github.com/can1357/oh-my-pi/issues/6037), [#6284](https://github.com/can1357/oh-my-pi/issues/6284))
+
 ## [17.0.7] - 2026-07-21
 
 ### Fixed

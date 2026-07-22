@@ -226,7 +226,13 @@ export function writeModelCache<TApi extends Api>(
 			for (const model of models) {
 				if (hasModelHeaders(model)) {
 					headerOmittedModelIds.push(model.id);
-					if (!headersEqual(model.headers, staticById.get(model.id)?.headers)) {
+					// Synthesized variants (e.g. Copilot `-1m`) have no same-id static
+					// entry; their headers come from the `requestModelId` base. Match
+					// against that source too, else they are wrongly flagged
+					// unrestorable and dropped on the next offline read (#6037, #6284).
+					const staticHeaderSource =
+						staticById.get(model.id) ?? (model.requestModelId ? staticById.get(model.requestModelId) : undefined);
+					if (!headersEqual(model.headers, staticHeaderSource?.headers)) {
 						unrestorableHeaderModelIds.push(model.id);
 					}
 				}

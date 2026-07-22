@@ -1143,8 +1143,16 @@ export class ModelRegistry {
 					models.push(spec);
 					continue;
 				}
-				if (unrestorableHeaderIds.has(spec.id)) continue;
-				const bundledHeaders = bundledById?.get(spec.id)?.headers;
+				// A same-id bundled match is trusted only when the row did not flag
+				// the model unrestorable. Synthesized variants (Copilot `-1m`)
+				// recover through `requestModelId`, whose bundled source is where
+				// their headers came from — honoured even past a stale
+				// `unrestorable` marker written before the fallback existed
+				// (#6037, #6284).
+				const bundledHeaders = (
+					(unrestorableHeaderIds.has(spec.id) ? undefined : bundledById?.get(spec.id)) ??
+					(spec.requestModelId ? bundledById?.get(spec.requestModelId) : undefined)
+				)?.headers;
 				if (!bundledHeaders) continue;
 				models.push({ ...spec, headers: bundledHeaders });
 			}

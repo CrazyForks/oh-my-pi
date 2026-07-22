@@ -6,7 +6,8 @@ import { Effort, type FetchImpl, type Model } from "@oh-my-pi/pi-ai";
 import type { OAuthCredentials } from "@oh-my-pi/pi-ai/oauth/types";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { writeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
-import type { OpenAICompat } from "@oh-my-pi/pi-catalog/types";
+import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
+import type { ModelSpec, OpenAICompat } from "@oh-my-pi/pi-catalog/types";
 import { applyLlamaCppQwenThinking } from "@oh-my-pi/pi-coding-agent/config/model-discovery";
 import { kNoAuth, ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest } from "@oh-my-pi/pi-coding-agent/config/settings";
@@ -2132,5 +2133,34 @@ describe("ModelRegistry runtime discovery", () => {
 
 		expect(registry.find("litellm-test", "team-gpt")?.contextWindow).toBe(200_000);
 		expect(registry.find("litellm-test", "deployment-id")).toBeUndefined();
+	});
+
+	test("startup restores a legacy stale-marked Copilot -1m variant via requestModelId", () => {
+		// Regression for #6037/#6284: a synthesized Copilot `-1m` long-context
+		// variant keeps the base model's transport headers via `requestModelId`.
+		// The v10 cache omits headers, and legacy rows written by the old id-only
+		// writer flag the variant unrestorable (its base is a different id). The
+		// startup loader must still recover the headers from the bundled base and
+		// keep the model selectable instead of dropping it.
+		const bundledBase = getBundledModel("github-copilot", "gpt-5.6-sol");
+		if (!bundledBase?.headers) {
+			throw new Error("Expected bundled Copilot base to carry transport headers");
+		}
+		const cachedVariant = buildModel({
+			...(bundledBase as ModelSpec<"openai-responses">),
+			id: "gpt-5.6-sol-1m",
+			name: "GPT-5.6 Sol (1M)",
+			requestModelId: "gpt-5.6-sol",
+			contextWindow: 1_050_000,
+		});
+		// Emulate a legacy write: the variant has no same-id static header source,
+		// so it is flagged unrestorable even though its base carries the headers.
+		writeModelCache("github-copilot", Date.now(), [cachedVariant], true, "", cacheDbPath);
+
+		const registry = new ModelRegistry(authStorage, modelsJsonPath);
+
+		const restored = registry.find("github-copilot", "gpt-5.6-sol-1m");
+		expect(restored).toBeDefined();
+		expect(restored?.headers).toEqual(bundledBase.headers);
 	});
 });

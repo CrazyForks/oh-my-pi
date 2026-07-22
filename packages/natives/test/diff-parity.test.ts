@@ -103,6 +103,60 @@ describe("native diff parity with jsdiff", () => {
 		}
 	});
 
+	test("seeded random word diffs", () => {
+		// Token pool stresses jsdiff's word/whitespace boundary rules: repeated
+		// and mixed whitespace, tabs, newlines, punctuation runs, Latin
+		// extended, non-Latin scripts, emoji (surrogate pairs), and digits.
+		const tokens = [
+			"word",
+			"Wörter",
+			"naïve",
+			"λέξη",
+			"слово",
+			"単語",
+			"🚀",
+			"👍🏽",
+			"can't",
+			"co-op",
+			"...",
+			"!?",
+			";",
+			"(x)",
+			"42",
+			"3.14",
+			" ",
+			"  ",
+			"\t",
+			" \t ",
+			"\n",
+			"\n\n",
+			" \n ",
+		];
+		const rng = makeRng(0xd1ff);
+		const build = (len: number) => {
+			let s = "";
+			for (let i = 0; i < len; i++) s += tokens[Math.floor(rng() * tokens.length)];
+			return s;
+		};
+		for (let round = 0; round < 200; round++) {
+			const a = build(Math.floor(rng() * 40));
+			// Mix related pairs (mutations of `a`) with unrelated pairs.
+			let b: string;
+			if (round % 2 === 0) {
+				b = build(Math.floor(rng() * 40));
+			} else {
+				const parts = a.split(/(\s+)/).filter(Boolean);
+				for (let i = 0; i < parts.length; i++) {
+					const roll = rng();
+					if (roll < 0.15) parts[i] = tokens[Math.floor(rng() * tokens.length)] ?? "";
+					else if (roll < 0.25) parts[i] = "";
+				}
+				b = parts.join("");
+			}
+			expect(natChanges(diffWords(a, b))).toEqual(jsChanges(Diff.diffWords(a, b)));
+		}
+	});
+
 	test("seeded random documents", () => {
 		const rng = makeRng(0xc0ffee);
 		for (let round = 0; round < 30; round++) {

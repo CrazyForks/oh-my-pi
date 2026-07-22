@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added SuperGrok (`xai-oauth`) usage tracking for weekly credits, product limits, and positive on-demand caps.
+
 ## [17.0.6] - 2026-07-20
 
 ### Fixed
@@ -10,9 +14,6 @@
 - Fixed Devin total-token usage omitting cache reads and cache writes.
 - Fixed model switches to Devin rejecting foreign provider response IDs, reasoning signatures, and empty interrupted turns as invalid Cascade history.
 - Classified zero-output Devin `invalid_argument` trailers as context overflow when the serialized message history is already large, routing cumulative tool-output payload failures through context maintenance—including artifact-backed shake rescue—instead of retrying the same rejected history.
-### Added
-
-- Added SuperGrok (`xai-oauth`) usage tracking for weekly credits, product limits, and positive on-demand caps.
 
 ## [17.0.5] - 2026-07-18
 

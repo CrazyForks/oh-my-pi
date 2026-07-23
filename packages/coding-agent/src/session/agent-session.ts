@@ -256,7 +256,8 @@ import type { Goal, GoalModeState } from "../goals/state";
 import type { HindsightSessionState } from "../hindsight/state";
 import { type LocalProtocolOptions, resolveLocalUrlToPath } from "../internal-urls";
 import { IrcBus, type IrcMessage } from "../irc/bus";
-import { resolveMemoryBackend } from "../memory-backend";
+import { resolveMemoryBackend } from "../memory-backend/resolve";
+import { MEMORY_BACKEND_TOOL_NAMES } from "../memory-backend/tool-names";
 import { shutdownMnemopiEmbedClient } from "../mnemopi/embed-client";
 import { getMnemopiSessionState, type MnemopiSessionState, setMnemopiSessionState } from "../mnemopi/state";
 import { containsOrchestrate, ORCHESTRATE_NOTICE } from "../modes/orchestrate";
@@ -936,6 +937,12 @@ export interface AgentSessionConfig {
 	/** Custom commands (TypeScript slash commands) */
 	customCommands?: LoadedCustomCommand[];
 	skillsSettings?: SkillsSettings;
+	/** Agent directory used when applying memory backend changes during a live session. */
+	memoryAgentDir?: string;
+	/** Recursion depth used to suppress live backend replacement in subagents. */
+	memoryTaskDepth?: number;
+	/** Creates the built-in memory tools allowed by the current backend selection. */
+	createMemoryTools?: () => Promise<AgentTool[]>;
 	/** Model registry for API key resolution and model discovery */
 	modelRegistry: ModelRegistry;
 	/** Tool registry for LSP and settings */
@@ -2258,6 +2265,11 @@ export class AgentSession {
 	#synchronouslyTerminatedYieldToolCallIds = new Set<string>();
 	#providerSessionState = new Map<string, ProviderSessionState>();
 	#hindsightSessionState: HindsightSessionState | undefined = undefined;
+	#memoryAgentDir: string | undefined;
+	#memoryTaskDepth = 0;
+	#createMemoryTools: (() => Promise<AgentTool[]>) | undefined;
+	#memoryBackendTransition: Promise<void> = Promise.resolve();
+	#localMemoryStartupAbort: AbortController | undefined;
 	readonly rawSseDebugBuffer: RawSseDebugBuffer;
 
 	#resetPromptMaintenanceState(): void {
@@ -2790,6 +2802,9 @@ export class AgentSession {
 		this.#skillsReloadable = config.skillsReloadable ?? true;
 		this.#skillsSettings = config.skillsSettings;
 		this.#modelRegistry = config.modelRegistry;
+		this.#memoryAgentDir = config.memoryAgentDir;
+		this.#memoryTaskDepth = config.memoryTaskDepth ?? 0;
+		this.#createMemoryTools = config.createMemoryTools;
 		// Resolve the wire service-tier per request so the Fireworks Priority
 		// toggle scopes priority to Fireworks alone, without mutating the shared
 		// session `serviceTier` that drives `/fast` and OpenAI/Anthropic priority.
@@ -6976,6 +6991,7 @@ export class AgentSession {
 	 */
 	beginDispose(): void {
 		this.#isDisposed = true;
+		this.cancelLocalMemoryStartup();
 		this.#titleGenerationAbortController.abort();
 		this.#abortAutolearnCapture();
 		this.#flushPendingIrcAsides();
@@ -7106,6 +7122,7 @@ export class AgentSession {
 			logger.warn("Post-prompt tasks still draining at dispose deadline", { error: String(error) });
 		}
 		await this.#drainAutolearnCapture();
+		await this.#memoryBackendTransition;
 
 		const hindsightState = this.getHindsightSessionState();
 		const mnemopiState = setMnemopiSessionState(this, undefined);
@@ -7845,13 +7862,126 @@ export class AgentSession {
 		}
 	}
 
+	/** Cancel the local rollout-memory startup owned by this session. */
+	cancelLocalMemoryStartup(): void {
+		this.#localMemoryStartupAbort?.abort();
+		this.#localMemoryStartupAbort = undefined;
+	}
+
+	/** Start a new local rollout-memory generation and cancel its predecessor. */
+	beginLocalMemoryStartup(): AbortSignal {
+		this.cancelLocalMemoryStartup();
+		const controller = new AbortController();
+		this.#localMemoryStartupAbort = controller;
+		return controller.signal;
+	}
+
+	/** Release the local startup slot if `signal` still owns it. */
+	endLocalMemoryStartup(signal: AbortSignal): void {
+		if (this.#localMemoryStartupAbort?.signal === signal) this.#localMemoryStartupAbort = undefined;
+	}
+
+	async #disposeMemoryBackendState(consolidateMnemopi = true): Promise<void> {
+		this.cancelLocalMemoryStartup();
+		const hindsight = this.getHindsightSessionState();
+		if (hindsight) {
+			try {
+				await hindsight.flushRetainQueue();
+			} catch (error) {
+				logger.warn("Memory lifecycle: Hindsight flush failed", { error: String(error) });
+			}
+			this.setHindsightSessionState(undefined);
+			hindsight.dispose();
+		}
+
+		const mnemopi = setMnemopiSessionState(this, undefined);
+		if (mnemopi) {
+			try {
+				await mnemopi.dispose({ consolidate: consolidateMnemopi });
+			} catch (error) {
+				logger.warn("Memory lifecycle: Mnemopi dispose failed", { error: String(error) });
+			}
+		}
+	}
+
+	/**
+	 * Apply the selected memory backend to runtime state, tools, and prompt.
+	 * Concurrent settings changes run in order and settle before the next turn.
+	 */
+	async applyMemoryBackend(): Promise<void> {
+		if (this.#isDisposed) return;
+		const transition = this.#memoryBackendTransition.then(() => this.#applyMemoryBackend());
+		this.#memoryBackendTransition = transition.then(
+			() => undefined,
+			() => undefined,
+		);
+		await transition;
+	}
+
+	async #applyMemoryBackend(): Promise<void> {
+		if (this.#isDisposed) return;
+		try {
+			await this.#disposeMemoryBackendState();
+			if (this.#memoryAgentDir && this.#memoryTaskDepth === 0 && !this.#isDisposed) {
+				const backend = await resolveMemoryBackend(this.settings);
+				await backend.start({
+					session: this,
+					settings: this.settings,
+					modelRegistry: this.#modelRegistry,
+					agentDir: this.#memoryAgentDir,
+					taskDepth: this.#memoryTaskDepth,
+				});
+			}
+			if (this.#isDisposed) return;
+			await this.#refreshMemoryTools();
+			if (this.#isDisposed) return;
+			await this.refreshBaseSystemPrompt();
+		} catch (error) {
+			await this.#disposeMemoryBackendState(false);
+			if (!this.#isDisposed) {
+				await this.#replaceMemoryTools([]).catch(refreshError => {
+					logger.warn("Failed to remove memory tools after backend apply error", {
+						error: String(refreshError),
+					});
+				});
+			}
+			throw error;
+		}
+	}
+
+	async #refreshMemoryTools(): Promise<void> {
+		const tools = (await this.#createMemoryTools?.()) ?? [];
+		await this.#replaceMemoryTools(tools);
+	}
+
+	async #replaceMemoryTools(tools: AgentTool[]): Promise<void> {
+		const removed = new Set<string>(MEMORY_BACKEND_TOOL_NAMES.filter(name => this.#builtInToolNames.has(name)));
+		const nextActive = this.getEnabledToolNames().filter(name => !removed.has(name));
+		for (const name of removed) {
+			this.#toolRegistry.delete(name);
+			this.#builtInToolNames.delete(name);
+		}
+
+		for (const tool of tools) {
+			if (!MEMORY_BACKEND_TOOL_NAMES.some(name => name === tool.name) || this.#toolRegistry.has(tool.name)) {
+				continue;
+			}
+			const wrapped = this.#wrapRuntimeTool(tool);
+			this.#toolRegistry.set(wrapped.name, wrapped);
+			this.#builtInToolNames.add(wrapped.name);
+			nextActive.push(wrapped.name);
+		}
+		await this.#applyActiveToolsByName([...new Set(nextActive)]);
+	}
+
 	/** Rebuild the base system prompt using the current active tool set. */
 	async refreshBaseSystemPrompt(): Promise<void> {
-		if (!this.#rebuildSystemPrompt) return;
+		if (this.#isDisposed || !this.#rebuildSystemPrompt) return;
 		const activeToolNames = this.getActiveToolNames();
 		this.#setActiveToolNames?.(activeToolNames);
 		const previousBaseSystemPrompt = this.#baseSystemPrompt;
 		const built = await this.#rebuildSystemPrompt(activeToolNames, this.#toolRegistry);
+		if (this.#isDisposed) return;
 		this.#baseSystemPrompt = built.systemPrompt;
 		this.#baseSystemPromptBeforeMemoryPromotion = undefined;
 		if (
@@ -9194,6 +9324,8 @@ export class AgentSession {
 				}
 			}
 
+			await this.#memoryBackendTransition;
+			if (this.#isDisposed || this.#promptGeneration !== generation) return;
 			const beforeAgentStartSystemPrompt = await this.#buildSystemPromptForAgentStart(expandedText);
 
 			// Emit before_agent_start extension event

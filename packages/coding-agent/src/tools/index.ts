@@ -518,6 +518,9 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 				if (!requestedTools.includes(name)) requestedTools.push(name);
 			}
 		}
+		if (session.settings.get("memory.backend") === "mnemopi" && !requestedTools.includes("memory_edit")) {
+			requestedTools.push("memory_edit");
+		}
 		// Auto-learn tools are gated by `autolearn.enabled` but, like the memory
 		// tools above, must also be force-included into an explicit requestedTools
 		// list so a restricted top-level session whose controller/guidance is
@@ -561,6 +564,7 @@ export async function createTools(session: ToolSession, toolNames?: string[]): P
 		if (name === "retain" || name === "recall" || name === "reflect") {
 			return ["hindsight", "mnemopi"].includes(session.settings.get("memory.backend") ?? "");
 		}
+		if (name === "memory_edit") return session.settings.get("memory.backend") === "mnemopi";
 		if (name === "manage_skill") return session.settings.get("autolearn.enabled") && (session.taskDepth ?? 0) === 0;
 		if (name === "learn") {
 			return (

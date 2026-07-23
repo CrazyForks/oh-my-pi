@@ -2,7 +2,7 @@
  * Tests for ExtensionRunner - conflict detection, error handling, tool wrapping.
  */
 
-import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, expectTypeOf, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AgentMessage, AgentTool } from "@oh-my-pi/pi-agent-core";
@@ -15,7 +15,7 @@ import {
 	ExtensionRunner,
 	testSetExtensionHandlerTimeoutMs,
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
-import type { ExtensionError } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
+import type { ExtensionError, ExtensionServiceTier } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/types";
 import { ExtensionToolWrapper } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/wrapper";
 import { Type } from "@oh-my-pi/pi-coding-agent/extensibility/typebox";
 import { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
@@ -529,8 +529,6 @@ describe("ExtensionRunner", () => {
 					setModel: async () => false,
 					getThinkingLevel: () => undefined,
 					setThinkingLevel: () => {},
-					getServiceTiers: () => ({}),
-					setServiceTier: () => {},
 					getSessionName: () => undefined,
 					setSessionName: async () => {},
 				},
@@ -1208,8 +1206,6 @@ describe("ExtensionRunner", () => {
 					setModel: async () => false,
 					getThinkingLevel: () => undefined,
 					setThinkingLevel: () => {},
-					getServiceTiers: () => ({}),
-					setServiceTier: () => {},
 					getSessionName: () => undefined,
 					setSessionName: async () => {},
 				},
@@ -1237,6 +1233,14 @@ describe("ExtensionRunner", () => {
 	});
 
 	describe("service tier API", () => {
+		it("restricts tiers to values supported by each provider family", () => {
+			expectTypeOf<"scale">().toExtend<ExtensionServiceTier<"openai">>();
+			expectTypeOf<"flex">().toExtend<ExtensionServiceTier<"google">>();
+			expectTypeOf<"priority">().toExtend<ExtensionServiceTier<"anthropic">>();
+			expectTypeOf<"scale">().not.toExtend<ExtensionServiceTier<"google">>();
+			expectTypeOf<"flex">().not.toExtend<ExtensionServiceTier<"anthropic">>();
+		});
+
 		it("returns a detached snapshot, forwards valid changes, and rejects invalid family tiers", async () => {
 			const extCode = `
 				export default function(pi) {
@@ -1246,7 +1250,12 @@ describe("ExtensionRunner", () => {
 						pi.appendEntry("service-tier-snapshot", tiers);
 						pi.setServiceTier("google", "flex");
 						pi.setServiceTier("openai", undefined);
+					});
+					pi.on("session_start", () => {
 						pi.setServiceTier("anthropic", "scale");
+					});
+					pi.on("session_start", () => {
+						pi.setServiceTier("bogus", "priority");
 					});
 				}
 			`;
@@ -1309,8 +1318,9 @@ describe("ExtensionRunner", () => {
 				["google", "flex"],
 				["openai", undefined],
 			]);
-			expect(errors).toHaveLength(1);
+			expect(errors).toHaveLength(2);
 			expect(errors[0]).toContain('Invalid service tier "scale" for family "anthropic"');
+			expect(errors[1]).toContain('Invalid service tier "priority" for family "bogus"');
 		});
 	});
 
@@ -1350,8 +1360,6 @@ describe("ExtensionRunner", () => {
 					setModel: async () => false,
 					getThinkingLevel: () => undefined,
 					setThinkingLevel: () => {},
-					getServiceTiers: () => ({}),
-					setServiceTier: () => {},
 					getSessionName: () => sessionManager.getSessionName(),
 					setSessionName: async name => {
 						await sessionManager.setSessionName(name);
@@ -1410,8 +1418,6 @@ describe("ExtensionRunner", () => {
 					setModel: async () => false,
 					getThinkingLevel: () => undefined,
 					setThinkingLevel: () => {},
-					getServiceTiers: () => ({}),
-					setServiceTier: () => {},
 					getSessionName: () => undefined,
 					setSessionName: async () => {},
 				},
@@ -2079,8 +2085,6 @@ describe("ExtensionRunner", () => {
 					setModel: async () => false,
 					getThinkingLevel: () => undefined,
 					setThinkingLevel: () => {},
-					getServiceTiers: () => ({}),
-					setServiceTier: () => {},
 					getSessionName: () => sessionManager.getSessionName(),
 					setSessionName: async () => {},
 				},

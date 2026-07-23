@@ -10,12 +10,12 @@ import type { OAuthAccountIdentity } from "../../../session/auth-storage";
 import { limitMatchesActiveAccount } from "../../../slash-commands/helpers/active-oauth-account";
 import { type ActiveRepoContext, resolveActiveRepoContextSync } from "../../../utils/active-repo-context";
 import * as git from "../../../utils/git";
+import * as jj from "../../../utils/jj";
 import { getSessionAccentAnsi, getSessionAccentHex } from "../../../utils/session-color";
 import { calculateTokensPerSecond } from "../../../utils/token-rate";
 import { sanitizeStatusText } from "../../shared";
 import { theme } from "../../theme/theme";
 import { canReuseCachedPr, createPrCacheContext, isSamePrCacheContext, type PrCacheContext } from "./git-utils";
-import * as jjInfo from "./jj-info";
 import { getPreset } from "./presets";
 import { renderSegment, type SegmentContext } from "./segments";
 import { getSeparator } from "./separators";
@@ -26,6 +26,8 @@ import type {
 	StatusLineSegmentOptions,
 	StatusLineSettings,
 } from "./types";
+
+const JJ_REFRESH_TTL_MS = 5000;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Context-usage memo
@@ -722,7 +724,7 @@ export class StatusLineComponent implements Component {
 	#jjRootFor(cwd: string): string | null {
 		if (this.#jjRoot === undefined || this.#jjRootCwd !== cwd) {
 			this.#jjRootCwd = cwd;
-			this.#jjRoot = jjInfo.findJjRoot(cwd);
+			this.#jjRoot = jj.repo.rootSync(cwd);
 			this.#cachedJjBranch = null;
 			this.#jjBranchLastFetch = 0;
 			this.#cachedJjStatus = null;
@@ -739,7 +741,7 @@ export class StatusLineComponent implements Component {
 		const cwd = effectiveGitCwd ?? this.#resolveActiveRepoCache().effectiveGitCwd;
 		const root = this.#jjRootFor(cwd);
 		if (!root) return null;
-		if (this.#jjBranchInFlight || Date.now() - this.#jjBranchLastFetch < jjInfo.JJ_BRANCH_TTL_MS) {
+		if (this.#jjBranchInFlight || Date.now() - this.#jjBranchLastFetch < JJ_REFRESH_TTL_MS) {
 			return this.#cachedJjBranch;
 		}
 		this.#jjBranchInFlight = true;
@@ -747,7 +749,7 @@ export class StatusLineComponent implements Component {
 		(async () => {
 			let next: string | null = null;
 			try {
-				next = await jjInfo.queryJjBranch(root);
+				next = await jj.workingCopy.label(root);
 			} finally {
 				this.#jjBranchInFlight = false;
 				// Advance the throttle only if no reset raced this query; a reset
@@ -773,7 +775,7 @@ export class StatusLineComponent implements Component {
 		const cwd = effectiveGitCwd ?? this.#resolveActiveRepoCache().effectiveGitCwd;
 		const root = this.#jjRootFor(cwd);
 		if (!root) return null;
-		if (this.#jjStatusInFlight || Date.now() - this.#jjStatusLastFetch < jjInfo.JJ_BRANCH_TTL_MS) {
+		if (this.#jjStatusInFlight || Date.now() - this.#jjStatusLastFetch < JJ_REFRESH_TTL_MS) {
 			return this.#cachedJjStatus;
 		}
 		this.#jjStatusInFlight = true;
@@ -781,7 +783,7 @@ export class StatusLineComponent implements Component {
 		(async () => {
 			let next: { staged: number; unstaged: number; untracked: number } | null = null;
 			try {
-				next = await jjInfo.queryJjStatus(root);
+				next = await jj.status.summary(root);
 			} finally {
 				this.#jjStatusInFlight = false;
 				if (this.#jjCacheGeneration === generation) this.#jjStatusLastFetch = Date.now();

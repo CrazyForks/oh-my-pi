@@ -6,9 +6,9 @@ import { getProjectDir, setProjectDir } from "@oh-my-pi/pi-utils";
 import { Settings, settings } from "../../../config/settings";
 import type { AgentSession } from "../../../session/agent-session";
 import * as git from "../../../utils/git";
+import * as jj from "../../../utils/jj";
 import { getThemeByName, setThemeInstance } from "../../theme/theme";
 import { StatusLineComponent } from "./component";
-import * as jjInfo from "./jj-info";
 
 // Minimal session the git-only status line render path touches: state.messages
 // (token-rate scan), model window, streaming flag, and the async-job snapshot.
@@ -84,9 +84,9 @@ beforeEach(() => {
 		// jj status: return a clean summary so #getJjStatus never falls through to
 		// the real `git status` subprocess. Keeps the git segment's status empty so
 		// the visible content is exactly the branch label.
-		spyOn(jjInfo, "queryJjStatus").mockResolvedValue({ staged: 0, unstaged: 0, untracked: 0 }),
+		spyOn(jj.status, "summary").mockResolvedValue({ staged: 0, unstaged: 0, untracked: 0 }),
 		// Map each controlled project dir to a stable virtual jj root.
-		spyOn(jjInfo, "findJjRoot").mockImplementation(cwd => {
+		spyOn(jj.repo, "rootSync").mockImplementation(cwd => {
 			if (cwd === tmpA) return ROOT_A;
 			if (cwd === tmpB) return ROOT_B;
 			return null;
@@ -104,7 +104,7 @@ describe("StatusLineComponent jj cache coherence", () => {
 	it("invalidate() drops the throttled jj branch cache within its TTL and refetches", async () => {
 		// A live jj bookmark label; a second query for the SAME root returns a new
 		// label, simulating a colocated bookmark/HEAD move mid-TTL.
-		const branchSpy = spyOn(jjInfo, "queryJjBranch").mockResolvedValue("bookmark-v1");
+		const branchSpy = spyOn(jj.workingCopy, "label").mockResolvedValue("bookmark-v1");
 		spies.push(branchSpy);
 
 		const statusLine = new StatusLineComponent(makeSession());
@@ -140,7 +140,7 @@ describe("StatusLineComponent jj cache coherence", () => {
 		// Root A's query hangs on a deferred so it is still in flight when we
 		// switch repos; root B resolves with its own label.
 		const deferredA = Promise.withResolvers<string | null>();
-		const branchSpy = spyOn(jjInfo, "queryJjBranch").mockImplementation(async root => {
+		const branchSpy = spyOn(jj.workingCopy, "label").mockImplementation(async root => {
 			if (root === ROOT_A) return deferredA.promise;
 			if (root === ROOT_B) return "branch-B";
 			return null;
@@ -192,7 +192,7 @@ describe("StatusLineComponent jj cache coherence", () => {
 		// pre-invalidation result. The generation token must reject it.
 		const deferred = Promise.withResolvers<string | null>();
 		let call = 0;
-		const branchSpy = spyOn(jjInfo, "queryJjBranch").mockImplementation(async () => {
+		const branchSpy = spyOn(jj.workingCopy, "label").mockImplementation(async () => {
 			call++;
 			// First query (pre-invalidation) hangs; later queries return the fresh label.
 			return call === 1 ? deferred.promise : "bookmark-fresh";

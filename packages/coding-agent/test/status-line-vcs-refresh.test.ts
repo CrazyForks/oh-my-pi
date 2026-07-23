@@ -15,10 +15,10 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:te
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { StatusLineSettings } from "@oh-my-pi/pi-coding-agent/modes/components/status-line";
 import { StatusLineComponent } from "@oh-my-pi/pi-coding-agent/modes/components/status-line";
-import * as jjInfo from "@oh-my-pi/pi-coding-agent/modes/components/status-line/jj-info";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { GitRefHead } from "@oh-my-pi/pi-coding-agent/utils/git";
 import * as git from "@oh-my-pi/pi-coding-agent/utils/git";
+import * as jj from "@oh-my-pi/pi-coding-agent/utils/jj";
 import { getProjectDir, setProjectDir } from "@oh-my-pi/pi-utils";
 
 type GitStatus = { staged: number; unstaged: number; untracked: number };
@@ -119,9 +119,9 @@ describe("StatusLineComponent repaints when an async VCS fetch resolves", () => 
 		vi.spyOn(git.head, "resolveSync").mockReturnValue(null); // no git branch -> jj overlay
 		vi.spyOn(git.branch, "default").mockReturnValue(Promise.withResolvers<string | null>().promise);
 		vi.spyOn(git.status, "summary").mockReturnValue(Promise.withResolvers<GitStatus | null>().promise); // isolate the jj fire
-		vi.spyOn(jjInfo, "findJjRoot").mockReturnValue("/fake/jj/root");
+		vi.spyOn(jj.repo, "rootSync").mockReturnValue("/fake/jj/root");
 		const label = Promise.withResolvers<string | null>();
-		vi.spyOn(jjInfo, "queryJjBranch").mockReturnValue(label.promise);
+		vi.spyOn(jj.workingCopy, "label").mockReturnValue(label.promise);
 
 		const onBranchChange = vi.fn();
 		const component = new StatusLineComponent(makeSession());
@@ -143,10 +143,10 @@ describe("StatusLineComponent repaints when an async VCS fetch resolves", () => 
 		vi.spyOn(git.head, "resolveSync").mockReturnValue(null); // no git -> jj repo
 		vi.spyOn(git.branch, "default").mockReturnValue(Promise.withResolvers<string | null>().promise);
 		vi.spyOn(git.status, "summary").mockReturnValue(Promise.withResolvers<GitStatus | null>().promise);
-		vi.spyOn(jjInfo, "findJjRoot").mockReturnValue("/fake/jj/root");
-		vi.spyOn(jjInfo, "queryJjBranch").mockReturnValue(Promise.withResolvers<string | null>().promise); // isolate the status fire
+		vi.spyOn(jj.repo, "rootSync").mockReturnValue("/fake/jj/root");
+		vi.spyOn(jj.workingCopy, "label").mockReturnValue(Promise.withResolvers<string | null>().promise); // isolate the status fire
 		const status = Promise.withResolvers<GitStatus | null>();
-		vi.spyOn(jjInfo, "queryJjStatus").mockReturnValue(status.promise);
+		vi.spyOn(jj.status, "summary").mockReturnValue(status.promise);
 
 		const onBranchChange = vi.fn();
 		const component = new StatusLineComponent(makeSession());

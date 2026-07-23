@@ -130,7 +130,8 @@ export interface BenchCachePairReport {
 	promptCacheKeyStable: true;
 	statefulResponsesDisabled: true;
 	freshProviderSessionState: true;
-	payloadStructureStable: boolean;
+	/** "unavailable" when a transport does not expose the provider payload locally. */
+	payloadStructureStable: boolean | "unavailable";
 }
 
 export interface BenchAverages {
@@ -784,15 +785,16 @@ export async function runBenchCommand(command: BenchCommandArgs, deps: BenchDepe
 							requestIdObserved: false,
 							responseCacheHit: false,
 						};
-						const coldSessionId = pairIndex === 0 ? testSessionId : randomSessionId();
-						// Keep credential rotation/stickiness identical for the cold/warm
-						// comparison, while each request retains its own transport session.
-						const credentialResolver = runtime.modelRegistry.resolver(model, coldSessionId);
+						// Keep the gateway's credential selection stable for both phases.
+						// Provider-session state is still recreated by runBenchRequest and
+						// stateful Responses chaining is disabled below.
+						const credentialAffinitySessionId = pairIndex === 0 ? testSessionId : randomSessionId();
+						const credentialResolver = runtime.modelRegistry.resolver(model, credentialAffinitySessionId);
 						const coldResult = await runBenchRequest(
 							model,
 							{
 								apiKey: credentialResolver,
-								sessionId: coldSessionId,
+								sessionId: credentialAffinitySessionId,
 								prompt: "Cache benchmark suffix A.",
 								contextMessages: cacheBenchmarkMessages(stablePrefix, "Cache benchmark suffix A."),
 								maxTokens,
@@ -810,12 +812,11 @@ export async function runBenchCommand(command: BenchCommandArgs, deps: BenchDepe
 							requestIdObserved: false,
 							responseCacheHit: false,
 						};
-						const warmSessionId = randomSessionId();
 						const warmResult = await runBenchRequest(
 							model,
 							{
 								apiKey: credentialResolver,
-								sessionId: warmSessionId,
+								sessionId: credentialAffinitySessionId,
 								prompt: "Cache benchmark suffix B.",
 								contextMessages: cacheBenchmarkMessages(stablePrefix, "Cache benchmark suffix B."),
 								maxTokens,
@@ -839,8 +840,9 @@ export async function runBenchCommand(command: BenchCommandArgs, deps: BenchDepe
 							statefulResponsesDisabled: true,
 							freshProviderSessionState: true,
 							payloadStructureStable:
-								coldCapture.payloadStructure !== undefined &&
-								coldCapture.payloadStructure === warmCapture.payloadStructure,
+								coldCapture.payloadStructure === undefined || warmCapture.payloadStructure === undefined
+									? "unavailable"
+									: coldCapture.payloadStructure === warmCapture.payloadStructure,
 						};
 					},
 				);

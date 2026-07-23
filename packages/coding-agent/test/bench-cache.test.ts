@@ -20,6 +20,11 @@ const model = {
 	contextWindow: 128_000,
 } as unknown as Model<Api>;
 
+const piNativeModel = {
+	...model,
+	transport: "pi-native",
+} as unknown as Model<Api>;
+
 const codexModel = {
 	...model,
 	provider: "openai-codex",
@@ -112,7 +117,7 @@ describe("bench cache mode", () => {
 		expect(calls).toHaveLength(2);
 		expect(calls[0]?.options.promptCacheKey).toBe(calls[1]?.options.promptCacheKey);
 		expect(calls[0]?.options.apiKey).toBe(calls[1]?.options.apiKey);
-		expect(calls[0]?.options.sessionId).not.toBe(calls[1]?.options.sessionId);
+		expect(calls[0]?.options.sessionId).toBe(calls[1]?.options.sessionId);
 		expect(calls[0]?.options.providerSessionState).not.toBe(calls[1]?.options.providerSessionState);
 		expect(calls[0]?.options.providerSessionState?.size).toBe(0);
 		expect(calls[1]?.options.providerSessionState?.size).toBe(0);
@@ -134,6 +139,47 @@ describe("bench cache mode", () => {
 		expect(stdout).not.toContain("Prompt-cache benchmark stable prefix");
 		expect(stdout).not.toContain("bench-cache:");
 		expect(stdout).not.toContain("Cache benchmark suffix");
+	});
+
+	it("keeps pi-native credential affinity while marking gateway-hidden payload diagnostics unavailable", async () => {
+		const calls: SimpleStreamOptions[] = [];
+		const summary = await runBenchCommand(
+			{ models: ["openai/gpt-cache-test"], flags: { cache: true, json: true } },
+			{
+				createRuntime: async () => ({
+					modelRegistry: { ...registry, getAll: () => [piNativeModel] },
+					close: () => {},
+				}),
+				randomSessionId: (() => {
+					let id = 0;
+					return () => `session-${++id}`;
+				})(),
+				writeStdout: () => {},
+				writeStderr: () => {},
+				setExitCode: () => {},
+				streamSimple: (_model, _context, options) => {
+					calls.push(options!);
+					void options?.onResponse?.({
+						status: 200,
+						requestId: `gateway-request-${calls.length}`,
+						headers: { "x-request-id": `gateway-request-${calls.length}` },
+					});
+					return streamWithMessage(successfulMessage(0, 0));
+				},
+				stdoutIsTTY: false,
+			},
+		);
+
+		expect(calls).toHaveLength(2);
+		expect(calls[0]?.sessionId).toBe(calls[1]?.sessionId);
+		expect(calls[0]?.promptCacheKey).toBe(calls[1]?.promptCacheKey);
+		expect(calls[0]?.providerSessionState).not.toBe(calls[1]?.providerSessionState);
+		const pair = summary.models[0]?.cachePairs?.[0];
+		expect(pair?.payloadStructureStable).toBe("unavailable");
+		expect(pair?.cold.requestIdObserved).toBe(true);
+		expect(pair?.warm.requestIdObserved).toBe(true);
+		expect(pair?.cold.observations).toEqual(["no_provider_proof"]);
+		expect(pair?.warm.observations).toEqual(["no_provider_proof"]);
 	});
 
 	it("rejects Codex Responses cache mode before credentials or requests can imply independent pairs", async () => {

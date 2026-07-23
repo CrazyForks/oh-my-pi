@@ -776,6 +776,7 @@ function streamDispatch<TApi extends Api>(
 		...debugOptions,
 		fetch: wrapFetchForProxy(debugOptions.fetch ?? (globalThis.fetch as FetchImpl), model.provider),
 	} as OptionsForApi<TApi>;
+	assertExplicitOpenAIResponsesPromptCacheSupport(model, requestOptions);
 
 	// Check custom API registry first (extension-provided APIs like "vertex-claude-api")
 	const customApiProvider = getCustomApi(model.api);
@@ -1013,7 +1014,6 @@ export function streamSimple<TApi extends Api>(
 		...debugOptions,
 		fetch: wrapFetchForProxy(debugOptions.fetch ?? (globalThis.fetch as FetchImpl), model.provider),
 	} as SimpleStreamOptions;
-	assertExplicitOpenAIResponsesPromptCacheSupport(model, requestOptions);
 
 	const apiKeyResolver = isApiKeyResolver(requestOptions?.apiKey) ? requestOptions.apiKey : undefined;
 	if (apiKeyResolver) {
@@ -1423,7 +1423,7 @@ function isOpenAIResponsesPromptCacheSurface<TApi extends Api>(model: Model<TApi
 
 function assertExplicitOpenAIResponsesPromptCacheSupport<TApi extends Api>(
 	model: Model<TApi>,
-	options?: SimpleStreamOptions,
+	options?: StreamOptions,
 ): void {
 	if (
 		model.transport === "pi-native" ||

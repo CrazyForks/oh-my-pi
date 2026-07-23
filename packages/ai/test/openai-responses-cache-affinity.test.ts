@@ -1,5 +1,9 @@
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import {
+	type AzureOpenAIResponsesOptions,
+	streamAzureOpenAIResponses,
+} from "@oh-my-pi/pi-ai/providers/azure-openai-responses";
+import {
 	buildParams,
 	type OpenAIResponsesOptions,
 	streamOpenAIResponses,
@@ -465,6 +469,28 @@ describe("OpenAI Responses explicit prompt cache policy", () => {
 			"OpenAI explicit prompt caching is unsupported",
 		);
 		expect(() => streamSimple(azureOpenAI56ResponsesModel, context, options)).toThrow(
+			"OpenAI explicit prompt caching is unsupported",
+		);
+		expect(fetchMock).not.toHaveBeenCalled();
+	});
+
+	it("rejects explicit policy through typed and direct Azure Responses dispatch", () => {
+		const fetchMock: FetchImpl = vi.fn(async () => {
+			throw new Error("Unsupported Azure Responses requests must not reach fetch");
+		});
+		const context: Context = {
+			messages: [{ role: "user", content: [{ type: "text", text: "prompt" }], timestamp: 0 }],
+		};
+		const options: AzureOpenAIResponsesOptions = {
+			apiKey: "test-key",
+			promptCache: { mode: "explicit" },
+			fetch: fetchMock,
+		};
+
+		expect(() => streamModel(azureOpenAI56ResponsesModel, context, options)).toThrow(
+			"OpenAI explicit prompt caching is unsupported",
+		);
+		expect(() => streamAzureOpenAIResponses(azureOpenAI56ResponsesModel, context, options)).toThrow(
 			"OpenAI explicit prompt caching is unsupported",
 		);
 		expect(fetchMock).not.toHaveBeenCalled();

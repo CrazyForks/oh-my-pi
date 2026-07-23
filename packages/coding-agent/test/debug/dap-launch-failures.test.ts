@@ -493,7 +493,10 @@ describe("connectSocket unix transport", () => {
 		// yields ECONNREFUSED/ENOENT from Bun.connect. Before the fix the error
 		// handler only errored the stream and the returned promise never settled,
 		// so `await connectSocket(...)` hung the launch forever.
-		const deadSocket = path.join(os.tmpdir(), `omp-dap-dead-${Date.now()}-${Math.random().toString(36).slice(2)}.sock`);
+		const deadSocket = path.join(
+			os.tmpdir(),
+			`omp-dap-dead-${Date.now()}-${Math.random().toString(36).slice(2)}.sock`,
+		);
 		const start = Date.now();
 		await expect(connectSocket({ unix: deadSocket }, 5_000)).rejects.toThrow();
 		// Must settle on the connect error, not linger until the timeout bound.

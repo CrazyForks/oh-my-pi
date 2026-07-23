@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed SuperGrok (`xai-oauth`) `/usage` showing "no usage data" for unified-billing accounts: when `?format=credits` lacks `creditUsagePercent` (or marks `isUnifiedBillingUser`), fall back to / merge the default monthly `monthlyLimit`/`used` payload.
+
 ## [17.0.9] - 2026-07-23
 
 ### Added

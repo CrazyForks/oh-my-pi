@@ -527,7 +527,7 @@ async function reloadServer(client: LspClient, serverName: string, signal?: Abor
 	try {
 		await sendNotification(client, "workspace/didChangeConfiguration", { settings: {} }, signal);
 		return `Reloaded ${serverName}`;
-	} catch (err) {
+	} catch {
 		throwIfAborted(signal);
 		// The reload notification could not be delivered — the connection is
 		// wedged or the process already died. Tear the client down (removing it

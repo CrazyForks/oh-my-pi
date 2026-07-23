@@ -369,7 +369,9 @@ async function startMessageReader(client: LspClient): Promise<void> {
 								// the server's message text is nonstandard (e.g. "Unknown request").
 								const code = message.error.code;
 								pending.reject(
-									new Error(`LSP error${typeof code === "number" ? ` ${code}` : ""}: ${message.error.message}`),
+									new Error(
+										`LSP error${typeof code === "number" ? ` ${code}` : ""}: ${message.error.message}`,
+									),
 								);
 							} else {
 								pending.resolve(message.result);

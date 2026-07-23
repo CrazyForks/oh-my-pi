@@ -38,8 +38,8 @@ import {
 	getSmitheryApiKey,
 	getSmitheryLoginUrl,
 	pollSmitheryCliAuthSession,
-	saveSmitheryApiKey,
 	type SmitheryCliPollResponse,
+	saveSmitheryApiKey,
 } from "../../mcp/smithery-auth";
 import { SmitheryConnectError } from "../../mcp/smithery-connect";
 import {

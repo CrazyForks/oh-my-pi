@@ -646,16 +646,14 @@ describe("RFC 8414 §3.3 issuer validation", () => {
 describe("bounded discovery fetches", () => {
 	// A fetch that never resolves on its own; it settles only when its
 	// AbortSignal fires. Pre-fix, discovery passed no signal, so this hung forever.
-	const hangingFetch: FetchImpl = (_input, init) =>
-		new Promise<Response>((_resolve, reject) => {
-			const signal = init?.signal;
-			const abort = () => reject(new DOMException("aborted", "AbortError"));
-			if (signal?.aborted) {
-				abort();
-				return;
-			}
-			signal?.addEventListener("abort", abort, { once: true });
-		});
+	const hangingFetch: FetchImpl = (_input, init) => {
+		const { promise, reject } = Promise.withResolvers<Response>();
+		const signal = init?.signal;
+		const abort = () => reject(new DOMException("aborted", "AbortError"));
+		if (signal?.aborted) abort();
+		else signal?.addEventListener("abort", abort, { once: true });
+		return promise;
+	};
 
 	it("aborts hanging well-known discovery fetches instead of stalling", async () => {
 		const oauth = await discoverOAuthEndpoints("https://mcp.example.test/mcp", undefined, undefined, {

@@ -11,7 +11,7 @@ Agents marked BLOCKING run inline — results return in this call; non-blocking 
 {{/if}}
 
 # Task Design
-- **Agent typing:** Pick each item's `agent` type. Read-only research MUST use `agent: "scout"` (faster model). Use the general-purpose worker (`{{defaultAgent}}`) only when no specialist fits.
+- **Agent typing:** Pick each item's `agent` type. Read-only research MUST use `agent: "scout"` (faster model). Use default worker only when no specialist fits.
 - **No overhead:** Each `task` MUST instruct its agent to skip formatters, linters, and project-wide test suites. Run those once at the end.
 - **One-pass:** Prefer agents that investigate AND edit in one pass; spin a read-only scout only when affected files are genuinely unknown.
 
@@ -51,8 +51,6 @@ Agents marked BLOCKING run inline — results return in this call; non-blocking 
 # Communication
 Subagents start blank — no conversation history.{{#if ircEnabled}} Parent-to-subagent IRC delivered immediately as steering.{{/if}}
 Pass large payloads via `local://<path>` URIs, NEVER inline text.
-{{#if spawnAllowedAgentsText}}Current spawn policy allows: {{spawnAllowedAgentsText}}.
-{{/if}}
 
 # Format Contracts
 {{#if batchEnabled}}

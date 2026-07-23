@@ -266,7 +266,7 @@ export const SPINNER_GLYPH_ADVANCE_MS = 80;
 
 /** Phase-locked spinner glyph index shared by every live tool block so parallel
  * spinners advance in lockstep instead of each tracking its own start time. */
-export function sharedSpinnerFrame(frameCount: number, now: number = Date.now()): number {
+export function sharedSpinnerFrame(frameCount: number, now: number = performance.now()): number {
 	return frameCount > 0 ? Math.floor(now / SPINNER_GLYPH_ADVANCE_MS) % frameCount : 0;
 }
 
@@ -690,10 +690,10 @@ export class ToolExecutionComponent extends Container implements NativeScrollbac
 				// If a detached task interval from an older render path is still live,
 				// stop it the instant the block leaves the repaintable region.
 				if (this.#maybeFreezeBackgroundTask()) return;
+				const now = performance.now();
 				const frameCount = theme.spinnerFrames.length;
-				this.#spinnerFrame = frameCount > 0 ? ((this.#spinnerFrame ?? 0) + 1) % frameCount : 0;
+				this.#spinnerFrame = sharedSpinnerFrame(frameCount, now);
 				this.#renderState.spinnerFrame = this.#spinnerFrame;
-				this.#updateDisplay();
 				// Component-scoped: a spinner tick only changes this tool block, so
 				// the TUI reuses every other root subtree instead of walking the
 				// whole tree (issue #4377).

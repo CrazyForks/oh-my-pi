@@ -1,6 +1,7 @@
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { supportsAllTurnsReasoningContext, supportsCodexReasoningSummary } from "@oh-my-pi/pi-catalog/identity";
 import { requireSupportedEffort } from "@oh-my-pi/pi-catalog/model-thinking";
+import { $env } from "@oh-my-pi/pi-utils";
 import type { Model } from "../../types";
 import { mapOpenAIReasoningEffort } from "../openai-shared";
 
@@ -92,14 +93,20 @@ export interface RequestBody {
 
 /**
  * Resolve whether a Codex request uses the Responses Lite transport: an
- * explicit option wins, otherwise the model's catalog flag (codex-rs
- * `model_info.use_responses_lite`) decides.
+ * explicit option wins, then the `PI_CODEX_RESPONSES_LITE` env override
+ * (`1`/`true` forces Lite, `0`/`false` forces the full Responses body),
+ * otherwise the model's catalog flag (codex-rs `model_info.use_responses_lite`)
+ * decides.
  */
 export function resolveCodexResponsesLite(
 	model: Model<"openai-codex-responses">,
 	requested: boolean | undefined,
 ): boolean {
-	return requested ?? model.useResponsesLite === true;
+	if (requested !== undefined) return requested;
+	const env = $env.PI_CODEX_RESPONSES_LITE?.trim().toLowerCase();
+	if (env === "1" || env === "true") return true;
+	if (env === "0" || env === "false") return false;
+	return model.useResponsesLite === true;
 }
 
 /**

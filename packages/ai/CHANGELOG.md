@@ -5,9 +5,11 @@
 ### Fixed
 
 - Fixed stateful OpenAI Responses explicit cache breakpoints being restored onto edited historical messages, ensuring full replays recompute the latest stable cache boundary.
+- Fixed ChatGPT Codex standard and Lite transports rejecting or hiding native computer-use payloads by unrolling the tool definition, forced choice, `computer_call`, and `computer_call_output` into ordinary function-tool forms.
 ### Added
 
 - Added OpenAI Responses native computer-use transport, including batched actions and exact `computer_call`/`computer_call_output` replay with pending/acknowledged safety checks and `image_url`/`file_id` output references. Models without native support receive the same action surface as a regular function tool; provider-specific tool-choice forcing is used where supported.
+- Added `PI_CODEX_RESPONSES_LITE` to override the catalog-selected Codex Responses transport for diagnostics (`1`/`true` forces Lite; `0`/`false` forces the standard body).
 
 ## [17.1.0] - 2026-07-24
 

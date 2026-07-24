@@ -41,6 +41,7 @@ import type {
 	Tool,
 	ToolCall,
 	ToolChoice,
+	ToolResultMessage,
 	Usage,
 } from "../types";
 import {
@@ -1095,11 +1096,6 @@ export function normalizeCodexToolChoice(
 ): string | Record<string, unknown> | undefined {
 	if (!choice) return undefined;
 	if (typeof choice === "string") return choice;
-	if (choice.type === "computer") {
-		return model?.supportsComputerUse === true && tools.some(tool => tool.native?.type === "computer")
-			? { type: "computer" }
-			: undefined;
-	}
 	const allowFreeform = model ? model.applyPatchToolType === "freeform" : false;
 	const mapName = (name: string): Record<string, string> | undefined => {
 		const directTool = tools.find(tool => tool.name === name);
@@ -1112,6 +1108,10 @@ export function normalizeCodexToolChoice(
 			? { type: "custom", name: customTool.customWireName ?? customTool.name }
 			: { type: "function", name: offeredTool.name };
 	};
+	if (choice.type === "computer") {
+		const computer = tools.find(tool => tool.native?.type === "computer");
+		return computer ? { type: "function", name: computer.name } : undefined;
+	}
 	if (choice.type === "function") {
 		if ("function" in choice && choice.function?.name) {
 			return mapName(choice.function.name);
@@ -1124,6 +1124,74 @@ export function normalizeCodexToolChoice(
 		return mapName(choice.name);
 	}
 	return undefined;
+}
+function unrollCodexComputerItems(items: ResponseInput, supportsImageDetailOriginal: boolean): ResponseInput {
+	const unrolled: ResponseInput = [];
+	for (const item of items) {
+		if (item.type === "computer_call") {
+			const actions = item.actions ?? (item.action ? [item.action] : []);
+			unrolled.push({
+				type: "function_call",
+				call_id: item.call_id,
+				name: "computer",
+				arguments: JSON.stringify({ actions }),
+				status: item.status,
+			});
+			continue;
+		}
+		if (item.type === "computer_call_output") {
+			const image =
+				typeof item.output.image_url === "string" && item.output.image_url.length > 0
+					? ({
+							type: "input_image",
+							detail: supportsImageDetailOriginal ? "original" : "auto",
+							image_url: item.output.image_url,
+						} satisfies ResponseInputContent)
+					: typeof item.output.file_id === "string" && item.output.file_id.length > 0
+						? ({
+								type: "input_image",
+								detail: supportsImageDetailOriginal ? "original" : "auto",
+								file_id: item.output.file_id,
+							} satisfies ResponseInputContent)
+						: undefined;
+			unrolled.push({
+				type: "function_call_output",
+				call_id: item.call_id,
+				output: image ? "(see attached image)" : "",
+			});
+			if (image) {
+				unrolled.push({
+					role: "user",
+					content: [{ type: "input_text", text: "Attached image from computer tool result:" }, image],
+				});
+			}
+			continue;
+		}
+		unrolled.push(item);
+	}
+	return unrolled;
+}
+
+function unrollCodexComputerAssistantMessage(message: AssistantMessage): AssistantMessage {
+	let changed = false;
+	const content = message.content.map(block => {
+		if (block.type !== "toolCall" || block.providerMetadata?.type !== "computer") return block;
+		changed = true;
+		const call: ToolCall = {
+			...block,
+			arguments: { actions: structuredCloneJSON(block.providerMetadata.actions) },
+		};
+		delete call.providerMetadata;
+		return call;
+	});
+	return changed ? { ...message, content } : message;
+}
+
+function unrollCodexComputerToolResult(message: ToolResultMessage): ToolResultMessage {
+	if (message.providerMetadata?.type !== "computer") return message;
+	const result: ToolResultMessage = { ...message };
+	delete result.providerMetadata;
+	return result;
 }
 
 function getCodexServiceTierCostMultiplier(
@@ -4011,7 +4079,6 @@ function convertMessages(model: Model<"openai-codex-responses">, context: Contex
 	// messages can be replayed as `custom_tool_call_output` rather than
 	// `function_call_output` (OpenAI rejects mismatched pairs).
 	const customCallIds = new Set<string>();
-	const computerCallIds = new Set<string>();
 	const knownCallIds = new Set<string>();
 
 	for (const msg of transformedMessages) {
@@ -4022,23 +4089,19 @@ function convertMessages(model: Model<"openai-codex-responses">, context: Contex
 				| undefined;
 			if (historyItems) {
 				const redactedHistoryItems = redactSensitiveInObject(historyItems).result as Array<ResponseInput[number]>;
-				for (const item of redactedHistoryItems) {
-					const maybe = item as { type?: string; call_id?: string };
-					if (maybe.type === "custom_tool_call" && typeof maybe.call_id === "string") {
-						customCallIds.add(maybe.call_id);
+				const replayItems = unrollCodexComputerItems(
+					redactedHistoryItems,
+					model.compat.supportsImageDetailOriginal,
+				);
+				for (const item of replayItems) {
+					if (item.type === "custom_tool_call") {
+						customCallIds.add(item.call_id);
 					}
-					if (maybe.type === "computer_call" && typeof maybe.call_id === "string") {
-						computerCallIds.add(maybe.call_id);
+					if ((item.type === "function_call" || item.type === "custom_tool_call") && item.call_id) {
+						knownCallIds.add(item.call_id);
 					}
-					if (
-						(maybe.type === "function_call" ||
-							maybe.type === "custom_tool_call" ||
-							maybe.type === "computer_call") &&
-						typeof maybe.call_id === "string"
-					)
-						knownCallIds.add(maybe.call_id);
 				}
-				messages.push(...redactedHistoryItems);
+				messages.push(...replayItems);
 				msgIndex += 1;
 				continue;
 			}
@@ -4064,26 +4127,22 @@ function convertMessages(model: Model<"openai-codex-responses">, context: Contex
 			if (historyItems) {
 				const sanitizedHistoryItems = sanitizeOpenAIResponsesAssistantHistoryItemsForReplay(historyItems);
 				if (sanitizedHistoryItems) {
-					for (const item of sanitizedHistoryItems) {
-						const maybe = item as { type?: string; call_id?: string };
-						if (maybe.type === "custom_tool_call" && typeof maybe.call_id === "string") {
-							customCallIds.add(maybe.call_id);
+					const replayItems = unrollCodexComputerItems(
+						sanitizedHistoryItems,
+						model.compat.supportsImageDetailOriginal,
+					);
+					for (const item of replayItems) {
+						if (item.type === "custom_tool_call") {
+							customCallIds.add(item.call_id);
 						}
-						if (maybe.type === "computer_call" && typeof maybe.call_id === "string") {
-							computerCallIds.add(maybe.call_id);
+						if ((item.type === "function_call" || item.type === "custom_tool_call") && item.call_id) {
+							knownCallIds.add(item.call_id);
 						}
-						if (
-							(maybe.type === "function_call" ||
-								maybe.type === "custom_tool_call" ||
-								maybe.type === "computer_call") &&
-							typeof maybe.call_id === "string"
-						)
-							knownCallIds.add(maybe.call_id);
 					}
 					if (providerPayload?.dt) {
-						messages.push(...sanitizedHistoryItems);
+						messages.push(...replayItems);
 					} else {
-						messages.splice(0, messages.length, ...sanitizedHistoryItems);
+						messages.splice(0, messages.length, ...replayItems);
 						// Keep customCallIds from the pre-splice state since historyItems may re-introduce them.
 					}
 					msgIndex += 1;
@@ -4093,7 +4152,7 @@ function convertMessages(model: Model<"openai-codex-responses">, context: Contex
 			}
 
 			const convertedOutputItems = convertResponsesAssistantMessage(
-				msg as AssistantMessage,
+				unrollCodexComputerAssistantMessage(msg as AssistantMessage),
 				model,
 				msgIndex,
 				knownCallIds,
@@ -4101,8 +4160,6 @@ function convertMessages(model: Model<"openai-codex-responses">, context: Contex
 				customCallIds,
 				false,
 				true,
-				undefined,
-				computerCallIds,
 			);
 			const outputItems = suppressHiddenEmptyFallback
 				? sanitizeOpenAIResponsesAssistantFallbackItemsForReplay(convertedOutputItems)
@@ -4117,14 +4174,13 @@ function convertMessages(model: Model<"openai-codex-responses">, context: Contex
 		if (msg.role === "toolResult") {
 			appendResponsesToolResultMessages(
 				messages,
-				msg,
+				unrollCodexComputerToolResult(msg),
 				model,
 				false,
 				model.compat.supportsImageDetailOriginal,
 				knownCallIds,
 				customCallIds,
 				true,
-				computerCallIds,
 			);
 		}
 
@@ -4165,8 +4221,8 @@ type CodexToolPayload =
 			name: string;
 			description: string;
 			format: { type: "grammar"; syntax: "lark" | "regex"; definition: string };
-	  }
-	| { type: "computer"; name?: never };
+	  };
+
 /** @internal Exported for tests. */
 export function convertOpenAICodexResponsesTools(
 	tools: Tool[],
@@ -4175,12 +4231,8 @@ export function convertOpenAICodexResponsesTools(
 	const allowFreeform = model.applyPatchToolType === "freeform";
 	const payloads: CodexToolPayload[] = [];
 	for (const tool of tools) {
-		if (tool.native?.type === "computer" && model.supportsComputerUse === true) {
-			payloads.push({ type: "computer" });
-			continue;
-		}
-		// Models without native computer support fall through and receive the
-		// tool as a plain function tool so function-calling models can drive it.
+		// The ChatGPT Codex endpoints reject the native `{ type: "computer" }`
+		// shape, so both standard and Lite transports expose it as a function.
 		if (allowFreeform && tool.customFormat) {
 			payloads.push({
 				type: "custom",

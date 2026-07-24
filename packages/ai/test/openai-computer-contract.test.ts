@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import {
+	convertCodexResponsesMessages,
 	convertOpenAICodexResponsesTools,
 	normalizeCodexToolChoice,
 } from "@oh-my-pi/pi-ai/providers/openai-codex-responses";
@@ -119,7 +120,10 @@ describe("OpenAI GA computer contract", () => {
 		expect(
 			normalizeCodexToolChoice({ type: "function", name: "computer" }, [computerTool], codexUnsupported),
 		).toEqual({ type: "function", name: "computer" });
-		expect(normalizeCodexToolChoice({ type: "computer" }, [computerTool], codexUnsupported)).toBeUndefined();
+		expect(normalizeCodexToolChoice({ type: "computer" }, [computerTool], codexUnsupported)).toEqual({
+			type: "function",
+			name: "computer",
+		});
 	});
 
 	test("parses batched streamed actions, stable item id, and safety checks", async () => {
@@ -399,10 +403,104 @@ describe("OpenAI GA computer contract", () => {
 		expect(replay.some(item => item.type === "function_call" && item.call_id === "call_new")).toBe(true);
 	});
 
-	test("uses the same native shape and forced choice for Codex", () => {
+	test("unrolls the native computer tool and forced choice for Codex", () => {
 		const codex = model("openai-codex-responses");
-		expect(convertOpenAICodexResponsesTools([computerTool], codex)).toEqual([{ type: "computer" }]);
-		expect(normalizeCodexToolChoice({ type: "computer" }, [computerTool], codex)).toEqual({ type: "computer" });
+		expect(convertOpenAICodexResponsesTools([computerTool], codex)).toMatchObject([
+			{ type: "function", name: "computer", description: "Control the host desktop" },
+		]);
+		expect(normalizeCodexToolChoice({ type: "computer" }, [computerTool], codex)).toEqual({
+			type: "function",
+			name: "computer",
+		});
 		expect(normalizeCodexToolChoice({ type: "computer" }, [], codex)).toBeUndefined();
+	});
+
+	test("unrolls native computer response history for Codex replay", () => {
+		const codex = model("openai-codex-responses");
+		const previous = {
+			...assistant([]),
+			api: "openai-codex-responses" as const,
+			provider: "openai-codex",
+			model: codex.id,
+			providerPayload: {
+				type: "openaiResponsesHistory" as const,
+				provider: "openai-codex",
+				dt: true,
+				items: [
+					{
+						type: "computer_call",
+						id: "item_codex_computer",
+						call_id: "call_codex_computer",
+						actions: [{ type: "screenshot" }],
+						pending_safety_checks: [],
+						status: "completed",
+					},
+					{
+						type: "computer_call_output",
+						call_id: "call_codex_computer",
+						output: { type: "computer_screenshot", file_id: "file_codex_computer" },
+						acknowledged_safety_checks: [],
+					},
+				],
+			},
+		};
+		const replay = convertCodexResponsesMessages(codex, { messages: [previous] });
+		expect(replay.some(item => item.type === "computer_call" || item.type === "computer_call_output")).toBe(false);
+		const call = replay.find(item => item.type === "function_call" && item.call_id === "call_codex_computer");
+		expect(call).toMatchObject({ type: "function_call", name: "computer" });
+		if (call?.type !== "function_call") throw new Error("Expected unrolled computer function call");
+		expect(JSON.parse(call.arguments)).toEqual({ actions: [{ type: "screenshot" }] });
+		expect(replay.some(item => item.type === "function_call_output" && item.call_id === "call_codex_computer")).toBe(
+			true,
+		);
+		expect(JSON.stringify(replay)).toContain("file_codex_computer");
+	});
+
+	test("unrolls internal computer calls and screenshot results for Codex replay", () => {
+		const codex = model("openai-codex-responses");
+		const call = {
+			...assistant([
+				{
+					type: "toolCall" as const,
+					id: "call_internal_computer|item_internal_computer",
+					name: "computer",
+					arguments: {},
+					providerMetadata: {
+						type: "computer" as const,
+						providerItemId: "item_internal_computer",
+						actions: [{ type: "screenshot" as const }],
+						pendingSafetyChecks: [],
+					},
+				},
+			]),
+			api: "openai-codex-responses" as const,
+			provider: "openai-codex",
+			model: codex.id,
+		};
+		const result: ToolResultMessage = {
+			role: "toolResult",
+			toolCallId: "call_internal_computer|item_internal_computer",
+			toolName: "computer",
+			content: [{ type: "image", data: "cG5n", mimeType: "image/png", detail: "original" }],
+			isError: false,
+			timestamp: 2,
+			providerMetadata: {
+				type: "computer",
+				screenshot: { type: "computer_screenshot", image_url: "data:image/png;base64,cG5n" },
+				acknowledgedSafetyChecks: [],
+			},
+		};
+		const replay = convertCodexResponsesMessages(codex, { messages: [call, result] });
+		expect(replay.some(item => item.type === "computer_call" || item.type === "computer_call_output")).toBe(false);
+		const functionCall = replay.find(
+			item => item.type === "function_call" && item.call_id === "call_internal_computer",
+		);
+		expect(functionCall).toMatchObject({ type: "function_call", name: "computer" });
+		if (functionCall?.type !== "function_call") throw new Error("Expected unrolled computer function call");
+		expect(JSON.parse(functionCall.arguments)).toEqual({ actions: [{ type: "screenshot" }] });
+		expect(
+			replay.some(item => item.type === "function_call_output" && item.call_id === "call_internal_computer"),
+		).toBe(true);
+		expect(JSON.stringify(replay)).toContain("data:image/png;base64,cG5n");
 	});
 });

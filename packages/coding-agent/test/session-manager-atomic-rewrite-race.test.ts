@@ -177,6 +177,8 @@ describe("SessionManager atomic rewrite race", () => {
 		sessionManager.appendCompaction("older summary", "older", firstKeptEntryId, 100);
 		await sessionManager.flush();
 		sessionManager.appendCompaction("newer summary", "newer", firstKeptEntryId, 80);
+		// Kick off a full-file rewrite that parks inside the fake storage until released.
+		const rewritePublished = sessionManager.rewriteEntries();
 		await storage.rewriteStarted.promise;
 
 		sessionManager.appendMessage({ role: "user", content: "during rewrite prompt", timestamp: Date.now() });
@@ -185,6 +187,7 @@ describe("SessionManager atomic rewrite race", () => {
 		const titlePersisted = sessionManager.setSessionName("Post rewrite title", "user", "test");
 
 		storage.allowRewrite.resolve();
+		await rewritePublished;
 		await titlePersisted;
 		await sessionManager.flush();
 		sessionManager.appendMessage({
@@ -288,9 +291,10 @@ describe("SessionManager atomic rewrite race", () => {
 		if (!firstKeptEntryId) throw new Error("Expected seeded branch entry");
 		sessionManager.appendCompaction("older summary", "older", firstKeptEntryId, 100);
 		await sessionManager.flush();
-		// Second compaction elides the first, scheduling a full-file rewrite that
-		// parks inside the fake storage until we release it.
 		sessionManager.appendCompaction("newer summary", "newer", firstKeptEntryId, 80);
+		// Kick off a full-file rewrite that parks inside the fake storage until we
+		// release it.
+		const rewritePublished = sessionManager.rewriteEntries();
 		await storage.rewriteStarted.promise;
 
 		// Simulate a Ctrl+C teardown: append a session_exit custom entry (fenced
@@ -308,8 +312,7 @@ describe("SessionManager atomic rewrite race", () => {
 		// stale body serialized before flushSync bumped the disk epoch; otherwise
 		// the async publish would overwrite the durable exit record.
 		storage.allowRewrite.resolve();
-		await Promise.resolve();
-		await Promise.resolve();
+		await rewritePublished;
 
 		const afterRelease = await storage.readText(sessionFile);
 		expect(afterRelease).toContain('"customType":"session_exit"');

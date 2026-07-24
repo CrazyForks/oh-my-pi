@@ -71,6 +71,7 @@ import {
 	applyOpenAIExtraBody,
 	applyOpenAIGatewayRouting,
 	applyResponsesCompatPolicy,
+	applyVercelResponsesCacheControls,
 	applyWireModelIdTransform,
 	buildResponsesDeltaInput,
 	buildResponsesInput,
@@ -359,6 +360,9 @@ type OpenAIResponsesSamplingParams = ResponseCreateParamsStreaming & {
 	provider?: OpenAICompat["openRouterRouting"];
 	reasoning?: { effort?: string } | { enabled: false };
 	cache_control?: OpenRouterAnthropicCacheControl;
+	caching?: "auto";
+	cache_anchor_items?: number;
+	cache_ttl?: "5m" | "1h";
 };
 
 function maybeAddOpenRouterAnthropicCacheControl(
@@ -1024,7 +1028,11 @@ export function buildParams(
 		params.reasoning = { ...params.reasoning, mode: model.reasoningMode };
 	}
 
-	applyOpenAIGatewayRouting(params, model.compat);
+	if (model.compat.isVercelGatewayHost) {
+		applyVercelResponsesCacheControls(params, model.compat, cacheRetention);
+	} else {
+		applyOpenAIGatewayRouting(params, model.compat);
+	}
 
 	applyOpenAIExtraBody(params, options?.extraBody);
 

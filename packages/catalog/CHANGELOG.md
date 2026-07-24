@@ -6,6 +6,8 @@
 
 - Added resolved Bedrock Converse prompt-cache compatibility limits, including explicit 5-minute checkpoint support for bundled Nova Lite, Micro, Pro, and Premier models plus Nova Premier's documented in-region model ID, and model-specific 1-hour Claude retention.
 - Added the native Meta Model API provider and Muse Spark 1.1 with Responses API reasoning replay, image input, and the full supported reasoning-effort ladder ([#4941](https://github.com/can1357/oh-my-pi/issues/4941)).
+- Added an opt-in Vercel AI Gateway automatic prompt-cache compatibility option alongside provider routing preferences.
+- Added Vercel AI Gateway Responses cache-anchor and cache-lifetime compatibility controls.
 
 ## [17.0.9] - 2026-07-23
 
